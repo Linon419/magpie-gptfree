@@ -197,6 +197,133 @@ class WebTextWorkerTests(unittest.TestCase):
             "alpha-2",
         )
 
+
+    def test_tracker_prefers_markdown_fallback_for_intelligent_ui_dil(self) -> None:
+        tracker = web_text_worker.WebTextStreamTracker()
+        # GPT-6 Intelligent UI: parts/0 carries DIL markup, metadata carries the
+        # plain-Markdown fallback the server compiles for clients that cannot render it.
+        tracker.feed_payload(json.dumps({
+            "v": {"message": {
+                "id": "ui-1",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [""]},
+                "metadata": {"model_dil_v2": {"fallbackMarkdown": ""}},
+            }}
+        }))
+        emitted = []
+        emitted.append(tracker.feed_payload(json.dumps({
+            "o": "patch",
+            "v": [
+                {"p": "/message/content/parts/0", "o": "append", "v": "## 蒙特卡洛\n\n<box border radius=\"lg\" padding={3} gap={2}>"},
+                {"p": "/message/metadata/model_dil_v2/fallbackMarkdown", "o": "append", "v": "## 蒙特卡洛\n\n"},
+            ],
+        })))
+        emitted.append(tracker.feed_payload(json.dumps({
+            "o": "patch",
+            "v": [
+                {"p": "/message/content/parts/0", "o": "append", "v": "<text color=\"secondary\">成本、销量</text></box>"},
+                {"p": "/message/metadata/model_dil_v2/fallbackMarkdown", "o": "append", "v": "成本、销量"},
+            ],
+        })))
+        emitted.append(tracker.finalize_delta())
+        text = "".join(emitted)
+        self.assertIn("蒙特卡洛", text)
+        self.assertIn("成本、销量", text)
+        self.assertNotIn("<box", text)
+        self.assertNotIn("<text", text)
+
+        # No fallbackMarkdown at all: finalize degrades DIL to text instead of leaking tags.
+        bare = web_text_worker.WebTextStreamTracker()
+        bare.feed_payload(json.dumps({
+            "v": {"message": {
+                "id": "ui-2",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [""]},
+                "metadata": {"model_dil_v2": {}},
+            }}
+        }))
+        bare.feed_payload(json.dumps({
+            "p": "/message/content/parts/0",
+            "o": "append",
+            "v": "{@body const x = 1}\n<box padding={2}>Hello</box>",
+        }))
+        tail = bare.finalize_delta()
+        self.assertIn("Hello", tail)
+        self.assertNotIn("<box", tail)
+        self.assertNotIn("{@body", tail)
+
+
+    def test_tracker_dil_fallback_respects_visibility_filters(self) -> None:
+        def dil_message(msg_id, *, content_type="text", metadata=None, **extra):
+            return {
+                "v": {"message": {
+                    "id": msg_id,
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": content_type, "parts": [""]},
+                    "metadata": metadata or {},
+                    **extra,
+                }}
+            }
+
+        def dil_patch(text, fallback):
+            return {
+                "o": "patch",
+                "v": [
+                    {"p": "/message/content/parts/0", "o": "append", "v": text},
+                    {"p": "/message/metadata/model_dil_v2/fallbackMarkdown", "o": "append", "v": fallback},
+                ],
+            }
+
+        # Hidden message carrying DIL must stay silent.
+        hidden = web_text_worker.WebTextStreamTracker()
+        hidden.feed_payload(json.dumps(dil_message(
+            "hidden-1",
+            metadata={
+                "is_visually_hidden_from_conversation": True,
+                "model_dil_v2": {"fallbackMarkdown": ""},
+            },
+        )))
+        self.assertEqual(hidden.feed_payload(json.dumps(dil_patch("<box>secret</box>", "secret"))), "")
+        self.assertEqual(hidden.finalize_delta(), "")
+
+        # Reasoning (thoughts) message carrying DIL must stay silent.
+        reasoning = web_text_worker.WebTextStreamTracker()
+        reasoning.feed_payload(json.dumps(dil_message(
+            "thought-1",
+            content_type="thoughts",
+            metadata={"model_dil_v2": {"fallbackMarkdown": ""}},
+        )))
+        self.assertEqual(reasoning.feed_payload(json.dumps(dil_patch("<box>thinking</box>", "thinking"))), "")
+        self.assertEqual(reasoning.finalize_delta(), "")
+
+        # Tool-directed message (recipient/channel not "all"/"final") must stay silent.
+        for extra in ({"recipient": "web.run"}, {"channel": "commentary"}):
+            tool = web_text_worker.WebTextStreamTracker()
+            tool.feed_payload(json.dumps(dil_message(
+                "tool-1",
+                metadata={"model_dil_v2": {"fallbackMarkdown": ""}},
+                **extra,
+            )))
+            self.assertEqual(tool.feed_payload(json.dumps(dil_patch("<box>tool</box>", "tool"))), "")
+            self.assertEqual(tool.finalize_delta(), "")
+
+        # A provisional hidden message that becomes visible may then stream its fallback.
+        provisional = web_text_worker.WebTextStreamTracker()
+        provisional.feed_payload(json.dumps(dil_message(
+            "prov-1",
+            metadata={
+                "is_visually_hidden_from_conversation": True,
+                "model_dil_v2": {"fallbackMarkdown": ""},
+            },
+        )))
+        self.assertEqual(provisional.feed_payload(json.dumps(dil_patch("<box>later</box>", "later"))), "")
+        visible_delta = provisional.feed_payload(json.dumps({
+            "p": "/message/metadata/is_visually_hidden_from_conversation",
+            "o": "remove",
+        }))
+        self.assertEqual(visible_delta, "later")
+        self.assertEqual(provisional.finalize_delta(), "")
+
     def test_end_to_end_stream_with_prepare_conduit_and_effort_fallback(self) -> None:
         conv_calls: list[dict] = []
 

@@ -10,6 +10,7 @@ Reads one JSON request payload from stdin and either:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 import uuid
@@ -156,6 +157,16 @@ def _is_hidden_text_path(path: str) -> bool:
     )
 
 
+def _dil_to_text(text: str) -> str:
+    """Crude DIL -> text fallback for upstreams that send no fallbackMarkdown."""
+    s = str(text or "")
+    s = re.sub(r"(?m)^\s*\{@body[^\n]*\}\s*$", "", s)
+    s = re.sub(r"\{#[^}]*\}|\{:[^}]*\}|\{/[^}]*\}", "", s)
+    s = re.sub(r"<[^>\n]+>", "", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
 def _infer_sse_error_status(code: str, message: str) -> int:
     lowered = f"{code} {message}".lower()
     if any(tok in lowered for tok in ("rate_limit", "too many", "limit_exceeded", "quota", "usage_limit")):
@@ -187,6 +198,8 @@ class WebTextStreamTracker:
     current_msg_raw: str = ""
     last_patch_path: str = "/message/content/parts/0"
     emitted_text: str = ""
+    active_dil_fallback: str = ""
+    active_has_dil: bool = False
     blocked: bool = False
     model_slug: str = ""
 
@@ -205,8 +218,23 @@ class WebTextStreamTracker:
             return False
         return True
 
+    def _current_visible_text(self) -> str:
+        # GPT-6 "Intelligent UI" responses stream DIL markup in parts/0; the
+        # server also streams a plain-Markdown fallbackMarkdown for clients
+        # that cannot render it. Prefer the fallback so downstream clients
+        # never receive raw <box>/<text> component tags.
+        #
+        # The fallback must go through the same visibility gate as parts/0:
+        # hidden, reasoning and tool-directed messages can also carry
+        # model_dil_v2, and their text must never reach the caller.
+        if not self._is_active_visible():
+            return ""
+        if self.active_has_dil:
+            return self.active_dil_fallback
+        return self.current_msg_raw
+
     def _combined_sanitized(self) -> str:
-        raw = "\n\n".join(s for s in [*self.completed_segments, self.current_msg_raw] if s)
+        raw = "\n\n".join(s for s in [*self.completed_segments, self._current_visible_text()] if s)
         return _sanitize_output_text(raw)
 
     def _next_delta(self, *, hold_partial_prefix: bool) -> str:
@@ -244,10 +272,12 @@ class WebTextStreamTracker:
             self.last_patch_path = ""
             return
 
+        is_new_message = bool(msg_id) and msg_id != self.current_msg_id
         previous_visible = self._is_active_visible()
-        if msg_id and msg_id != self.current_msg_id:
-            if previous_visible and self.current_msg_raw:
-                self.completed_segments.append(self.current_msg_raw)
+        if is_new_message:
+            visible_text = self._current_visible_text()
+            if previous_visible and visible_text:
+                self.completed_segments.append(visible_text)
             self.current_msg_id = msg_id
             self.current_msg_raw = ""
 
@@ -257,6 +287,15 @@ class WebTextStreamTracker:
         self.active_recipient = str(msg.get("recipient") or "").strip().lower()
         self.active_content_type = content_type
         self.active_hidden = metadata.get("is_visually_hidden_from_conversation") is True
+        dil = metadata.get("model_dil_v2")
+        if isinstance(dil, dict):
+            self.active_has_dil = True
+            self.active_dil_fallback = str(dil.get("fallbackMarkdown") or "")
+        elif is_new_message:
+            # A re-sent message without model_dil_v2 must not clear an active
+            # fallback; only a genuinely new message starts a new text source.
+            self.active_has_dil = False
+            self.active_dil_fallback = ""
 
         slug = str(metadata.get("model_slug") or "").strip()
         if slug and self.active_role == "assistant":
@@ -301,6 +340,11 @@ class WebTextStreamTracker:
             slug = str(op_v.get("model_slug") or "").strip()
             if slug and self.active_role == "assistant":
                 self.model_slug = slug
+            dil = op_v.get("model_dil_v2")
+            if isinstance(dil, dict):
+                self.active_has_dil = True
+                if isinstance(dil.get("fallbackMarkdown"), str):
+                    self.active_dil_fallback = dil["fallbackMarkdown"]
 
     def _handle_patch_op(self, op: dict[str, Any], *, apply_visibility: bool = True) -> None:
         op_p = op.get("p")
@@ -326,6 +370,9 @@ class WebTextStreamTracker:
                 if self._is_active_visible() and isinstance(op_v, (str, int, float)):
                     self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
                 return
+            if op_p.startswith("/message/metadata/model_dil_v2"):
+                self._apply_dil_op(op_p, op_o, op_v)
+                return
             if _is_hidden_text_path(op_p):
                 self.last_patch_path = op_p
             return
@@ -333,6 +380,17 @@ class WebTextStreamTracker:
         if op_p in (None, "") and op_o in ("append", "replace") and isinstance(op_v, str):
             if self._is_active_visible() and self.last_patch_path == "/message/content/parts/0":
                 self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
+
+    def _apply_dil_op(self, path: str, op: Any, value: Any) -> None:
+        self.active_has_dil = True
+        if path.endswith("/fallbackMarkdown"):
+            if op == "replace":
+                self.active_dil_fallback = str(value or "")
+            elif op == "append":
+                self.active_dil_fallback += str(value or "")
+        elif path == "/message/metadata/model_dil_v2" and isinstance(value, dict):
+            if isinstance(value.get("fallbackMarkdown"), str):
+                self.active_dil_fallback = value["fallbackMarkdown"]
 
     def _handle_patch_list(self, items: list[Any]) -> None:
         dict_items = [item for item in items if isinstance(item, dict)]
@@ -405,6 +463,9 @@ class WebTextStreamTracker:
         return self._next_delta(hold_partial_prefix=True)
 
     def finalize_delta(self) -> str:
+        if self.active_has_dil and not self.active_dil_fallback and self.current_msg_raw:
+            # No fallbackMarkdown arrived (older upstream): degrade to text.
+            self.active_dil_fallback = _dil_to_text(self.current_msg_raw)
         return self._next_delta(hold_partial_prefix=False)
 
 
