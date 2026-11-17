@@ -144,6 +144,40 @@ test("a clustered 310-account pool drains before its tokens expire", async () =>
   }
 });
 
+test("a 24h interval with a 48h lead still drains 310 clustered tokens via catch-up ticks", async () => {
+  let now = 1_800_000_000_000;
+  const rows = Array.from({ length: 310 }, (_, i) => row(`c${i}@example.com`, Math.floor(now / 1000) + 40 * 3600));
+  const renewed = new Set();
+  const late = [];
+  const handle = startAutoRefresh({
+    immediate: false,
+    now: () => now,
+    read: async () => rows,
+    // The most relaxed cadence the settings file allows: one scan per day.
+    intervalMs: 24 * 60 * 60 * 1000,
+    leadMs: 48 * 60 * 60 * 1000,
+    maxPerTick: 100,
+    catchUpMs: 5 * 60 * 1000,
+    renew: async (account) => {
+      const exp = JSON.parse(Buffer.from(account.accessToken.split(".")[1], "base64url").toString()).exp * 1000;
+      if (now >= exp) late.push(account.email);
+      renewed.add(account.email);
+      account.accessToken = token(Math.floor(now / 1000) + 240 * 3600);
+      return account;
+    },
+  });
+  try {
+    for (let i = 0; i < 20 && renewed.size < 310; i++) {
+      const stats = await handle.tick();
+      now += stats.remaining > 0 ? 5 * 60 * 1000 : 24 * 60 * 60 * 1000;
+    }
+    assert.equal(renewed.size, 310);
+    assert.deepEqual(late, []);
+  } finally {
+    handle.stop();
+  }
+});
+
 test("auto refresh settings round-trip the proxy and stay enabled by default", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gptfree-auto-"));
   try {
