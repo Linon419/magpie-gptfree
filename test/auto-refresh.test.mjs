@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -175,6 +175,63 @@ test("a 24h interval with a 48h lead still drains 310 clustered tokens via catch
     assert.deepEqual(late, []);
   } finally {
     handle.stop();
+  }
+});
+
+test("the real timer retries a capped backlog after five minutes, not a full interval", async () => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 1_800_000_000_000;
+  const rows = Array.from({ length: 310 }, (_, i) => row(`t${i}@example.com`, Math.floor(now / 1000) + 40 * 3600));
+  const calls = [];
+  const handle = startAutoRefresh({
+    immediate: false,
+    now: () => now,
+    read: async () => rows,
+    intervalMs: 24 * 60 * 60 * 1000,
+    leadMs: 48 * 60 * 60 * 1000,
+    maxPerTick: 100,
+    catchUpMs: 5 * 60 * 1000,
+    renew: async (account) => {
+      calls.push(account.email);
+      account.accessToken = token(Math.floor(now / 1000) + 240 * 3600);
+      return account;
+    },
+  });
+  const flush = async () => {
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  };
+  try {
+    // First scan only happens when the configured 24h interval elapses.
+    mock.timers.tick(24 * 60 * 60 * 1000);
+    await flush();
+    now += 24 * 60 * 60 * 1000;
+    assert.equal(calls.length, 100);
+    assert.equal(handle.stats.remaining, 210);
+
+    // The backlog is picked up by the timer five minutes later, not in 24h.
+    mock.timers.tick(5 * 60 * 1000);
+    await flush();
+    now += 5 * 60 * 1000;
+    assert.equal(calls.length, 200);
+
+    mock.timers.tick(5 * 60 * 1000);
+    await flush();
+    now += 5 * 60 * 1000;
+    assert.equal(calls.length, 300);
+
+    mock.timers.tick(5 * 60 * 1000);
+    await flush();
+    now += 5 * 60 * 1000;
+    assert.equal(calls.length, 310);
+    assert.equal(handle.stats.remaining, 0);
+
+    // Backlog drained: a five-minute tick must not renew anything again.
+    mock.timers.tick(5 * 60 * 1000);
+    await flush();
+    assert.equal(calls.length, 310);
+  } finally {
+    handle.stop();
+    mock.timers.reset();
   }
 });
 
