@@ -431,6 +431,61 @@ class WebTextWorkerTests(unittest.TestCase):
         tracker.finalize_delta()
         self.assertEqual(tracker.emitted_text, "(正确答案：第一项)")
 
+    def test_fallback_buffer_and_prefix_are_scoped_to_each_message(self) -> None:
+        tracker = web_text_worker.WebTextStreamTracker()
+        output = []
+        def feed(event):
+            output.append(tracker.feed_payload(json.dumps(event)))
+        feed({"message": {
+            "id": "first", "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": ["<box>First</box>"]},
+            "metadata": {"model_dil_v2": {"fallbackMarkdown": "First"}},
+        }})
+        feed({"message": {
+            "id": "second", "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": ["Second"]},
+        }})
+        self.assertEqual(tracker.dil_fallback_buffer, "")
+        self.assertFalse(tracker.active_has_dil)
+        for chunk in ["Sec", "ond", " complete"]:
+            feed({"p": "/message/metadata/model_dil_v2/fallbackMarkdown",
+                  "o": "append", "v": chunk})
+        output.append(tracker.finalize_delta())
+        self.assertEqual("".join(output), "First\n\nSecond complete")
+        self.assertEqual(tracker.dil_fallback_buffer, "Second complete")
+
+    def test_compact_dil_patches_follow_their_own_path(self) -> None:
+        for compact in [{"v": " complete"}, {"o": "append", "v": " complete"}]:
+            with self.subTest(compact=compact):
+                tracker = web_text_worker.WebTextStreamTracker()
+                events = [
+                    {"message": {"id": "a", "author": {"role": "assistant"},
+                     "content": {"content_type": "text", "parts": ["Answer"]}}},
+                    {"p": "/message/metadata/model_dil_v2/fallbackMarkdown",
+                     "o": "append", "v": "Answer"},
+                    compact,
+                ]
+                output = [tracker.feed_payload(json.dumps(e)) for e in events]
+                output.append(tracker.finalize_delta())
+                self.assertEqual("".join(output), "Answer complete")
+                self.assertEqual(tracker.current_msg_raw, "Answer")
+
+    def test_dil_constants_do_not_become_answer_text(self) -> None:
+        for path in ["constants/0", "code"]:
+            with self.subTest(path=path):
+                tracker = web_text_worker.WebTextStreamTracker()
+                events = [
+                    {"message": {"id": "a", "author": {"role": "assistant"},
+                     "content": {"content_type": "text", "parts": ["(正确答案：第 3 项)"]}}},
+                    {"p": "/message/metadata/model_dil_v2/" + path,
+                     "o": "replace", "v": "internal"},
+                    {"v": "\n\nWhat"},
+                    {"o": "append", "v": " hidden"},
+                ]
+                output = [tracker.feed_payload(json.dumps(e)) for e in events]
+                output.append(tracker.finalize_delta())
+                self.assertEqual("".join(output), "(正确答案：第 3 项)")
+
     def test_end_to_end_stream_with_prepare_conduit_and_effort_fallback(self) -> None:
         conv_calls: list[dict] = []
 

@@ -281,6 +281,9 @@ class WebTextStreamTracker:
                 self.completed_segments.append(visible_text)
             self.current_msg_id = msg_id
             self.current_msg_raw = ""
+            self.active_has_dil = False
+            self.active_dil_fallback = ""
+            self.dil_fallback_buffer = ""
 
         self.active_is_input_echo = False
         self.active_role = role
@@ -290,9 +293,12 @@ class WebTextStreamTracker:
         self.active_hidden = metadata.get("is_visually_hidden_from_conversation") is True
         dil = metadata.get("model_dil_v2")
         if isinstance(dil, dict):
-            self.active_has_dil = True
-            self.active_dil_fallback = str(dil.get("fallbackMarkdown") or "")
-            self.dil_fallback_buffer = self.active_dil_fallback
+            if is_new_message:
+                self.active_has_dil = True
+                self.active_dil_fallback = str(dil.get("fallbackMarkdown") or "")
+                self.dil_fallback_buffer = self.active_dil_fallback
+            elif isinstance(dil.get("fallbackMarkdown"), str):
+                self._set_dil_fallback(dil["fallbackMarkdown"])
         elif is_new_message:
             # A re-sent message without model_dil_v2 must not clear an active
             # fallback; only a genuinely new message starts a new text source.
@@ -371,6 +377,9 @@ class WebTextStreamTracker:
                     self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
                 return
             if op_p.startswith("/message/metadata/model_dil_v2"):
+                # Compact patches omit p after an explicit path. Keep DIL
+                # constants/code and fallback continuations out of parts/0.
+                self.last_patch_path = op_p
                 self._apply_dil_op(op_p, op_o, op_v)
                 return
             if _is_hidden_text_path(op_p):
@@ -378,7 +387,9 @@ class WebTextStreamTracker:
             return
 
         if op_p in (None, "") and op_o in ("append", "replace") and isinstance(op_v, str):
-            if self._is_active_visible() and self.last_patch_path == "/message/content/parts/0":
+            if self.last_patch_path == "/message/metadata/model_dil_v2/fallbackMarkdown":
+                self._apply_dil_op(self.last_patch_path, op_o, op_v)
+            elif self._is_active_visible() and self.last_patch_path == "/message/content/parts/0":
                 self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
 
     def _set_dil_fallback(self, text: str) -> None:
@@ -397,8 +408,16 @@ class WebTextStreamTracker:
         if self.active_has_dil:
             self.active_dil_fallback = self.dil_fallback_buffer
             return
-        emitted = self.emitted_text
-        if not emitted or self.dil_fallback_buffer.startswith(emitted):
+        # Compare complete output candidates: fallbackMarkdown belongs to the
+        # current message, whereas emitted_text includes completed messages.
+        candidate = _sanitize_output_text("\n\n".join(
+            s for s in [*self.completed_segments, self.dil_fallback_buffer] if s
+        ))
+        if not self.input_message_ids and self.assistant_history_messages:
+            candidate = strip_history_prefix(
+                candidate, self.assistant_history_messages, hold_partial_prefix=True,
+            )
+        if not self.emitted_text or candidate.startswith(self.emitted_text):
             self.active_has_dil = True
             self.active_dil_fallback = self.dil_fallback_buffer
 
@@ -476,9 +495,8 @@ class WebTextStreamTracker:
             self._handle_patch_op(event)
         elif isinstance(val, list):
             self._handle_patch_list(val)
-        elif isinstance(val, str) and "p" not in event and "o" not in event:
-            if self._is_active_visible() and self.last_patch_path == "/message/content/parts/0":
-                self.current_msg_raw += val
+        elif isinstance(val, str) and "p" not in event and event.get("o") in (None, "append", "replace"):
+            self._handle_patch_op({"o": event.get("o") or "append", "v": val})
 
         return self._next_delta(hold_partial_prefix=True)
 
