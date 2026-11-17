@@ -170,6 +170,12 @@ def _scan_dil_tag(s: str, i: int) -> Any:
     and quotes.
     """
     n = len(s)
+    # An opening tag never follows a word character, so "x<y" and "f(a)<3"
+    # are text; closing tags do follow text ("answer</badge>").
+    if i + 1 >= n:
+        return None
+    if i > 0 and s[i + 1] != "/" and (s[i - 1].isalnum() or s[i - 1] in ")]_"):
+        return -1
     j = i + 1
     closing = j < n and s[j] == "/"
     if closing:
@@ -265,6 +271,23 @@ def _dil_to_text(text: str, *, final: bool = True) -> str:
             line_start = c == "\n"
             i += 1
             continue
+        if c == "`":
+            run = 1
+            while i + run < n and s[i + run] == "`":
+                run += 1
+            fence = "`" * run
+            close = s.find(fence, i + run)
+            if close < 0:
+                if not final:
+                    break
+                out.append(s[i:i + run])
+                i += run
+                line_start = False
+                continue
+            out.append(s[i:close + run])
+            i = close + run
+            line_start = False
+            continue
         if c == "{" and (i + 1 >= n or s[i + 1] in "#:/"):
             if i + 1 >= n:
                 if not final:
@@ -276,8 +299,9 @@ def _dil_to_text(text: str, *, final: bool = True) -> str:
             if end < 0:
                 if not final:
                     break
-                i = n
-                break
+                out.append(c)
+                i += 1
+                continue
             i = end + 1
             line_start = False
             continue
@@ -286,8 +310,7 @@ def _dil_to_text(text: str, *, final: bool = True) -> str:
             if tag is None:
                 if not final:
                     break
-                i = n
-                break
+                tag = -1
             if tag != -1:
                 end, name, closing, self_closing = tag
                 if name == "AppBlock" and not closing and not self_closing:

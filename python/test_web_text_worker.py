@@ -604,6 +604,37 @@ class WebTextWorkerTests(unittest.TestCase):
         self.assertTrue(tracker.turn_complete)
         self.assertEqual(tracker.emitted_text, "Done")
 
+    def test_dil_rendering_never_drops_comparisons_or_inline_code(self) -> None:
+        cases = {
+            "Compare x<y": "Compare x<y",
+            "If a < b and b > c": "If a < b and b > c",
+            "f(n)<3 holds; x<=y too": "f(n)<3 holds; x<=y too",
+            "Use x <y at the end": "Use x <y at the end",
+            "Write `List<String>` and `a<b>c`": "Write `List<String>` and `a<b>c`",
+            "Unclosed `code<x": "Unclosed `code<x",
+            "Set {#value": "Set {#value",
+            "<badge>Correct answer</badge> x<y": "Correct answer x<y",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                final = web_text_worker._dil_to_text(source)
+                self.assertEqual(final, expected)
+                for i in range(len(source) + 1):
+                    partial = web_text_worker._dil_to_text(source[:i], final=False)
+                    self.assertTrue(final.startswith(partial), (i, partial))
+
+    def test_comparison_text_survives_the_tracker(self) -> None:
+        tracker = web_text_worker.WebTextStreamTracker()
+        tracker.feed_payload(json.dumps({"v": {"message": {
+            "id": "m", "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": [""]},
+            "metadata": {"model_dil_v2": {}},
+        }}}))
+        for chunk in ["<badge>Answer</badge>\n\nCompare ", "x<", "y and `a<b>`"]:
+            tracker.feed_payload(json.dumps({"p": "/message/content/parts/0", "o": "append", "v": chunk}))
+        tracker.finalize_delta()
+        self.assertEqual(tracker.emitted_text, "Answer\n\nCompare x<y and `a<b>`")
+
     def test_end_to_end_stream_with_prepare_conduit_and_effort_fallback(self) -> None:
         conv_calls: list[dict] = []
 
