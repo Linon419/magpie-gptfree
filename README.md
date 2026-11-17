@@ -139,6 +139,19 @@ https://github.com/yang0/magpie-gptfree
 
 ---
 
+## 导出到 CPA（CLIProxyAPI）
+
+「我的账号池」右上角有 **导出到 CPA**：把号池里的账号打包成 CLIProxyAPI 能读的 Codex 认证文件（`codex-<邮箱>.json`），ZIP 保存在：
+
+```
+~/.magpie-gptfree/exports/gptfree-cpa-<时间>.zip
+```
+
+导入 CPA：管理页 **Auth Files** 上传，或 `POST /v0/management/auth-files?name=<文件名>`，或解压到 CPA 的 `auth-dir`。压缩包里附一份 `README.txt`。
+
+> [!WARNING]
+> 号池只保存 Platform access_token，导出文件里的 `refresh_token` 为空：CPA 能用这些号直到 token 过期（当前批次大约 5–7 天），但无法自动续期，到期后重新导出即可。ZIP 里是明文凭证，只放本机或可信的 CPA 实例。
+
 ## 免责声明
 
 本项目为个人自用工具，与 OpenAI 无任何关联。插件只保存**你本人有权使用**的账号凭证，请遵守账号服务条款；因使用不当、批量采购账号或违反上游条款导致的封号、限流等后果由使用者自行承担。

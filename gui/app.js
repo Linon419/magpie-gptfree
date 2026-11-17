@@ -395,8 +395,25 @@
     const hasRows = !!$("poolList")?.querySelector(".account-row");
     $("refreshAllPool").disabled = poolBusy || !hasRows;
     if ($("syncProviders")) $("syncProviders").disabled = poolBusy;
+    if ($("exportCpa")) $("exportCpa").disabled = poolBusy;
     if ($("refreshStatsQuota")) $("refreshStatsQuota").disabled = poolBusy || !hasRows;
     if ($("reloadStats")) $("reloadStats").disabled = poolBusy;
+  }
+  async function exportCpaNow() {
+    if (poolBusy || busy) return;
+    if (!confirm("导出会生成包含明文 access_token 的 ZIP，保存到本机号池目录的 exports/ 下。继续？")) return;
+    setPoolBusyState(true);
+    try {
+      const res = await api("export/cpa", {});
+      if (res.warning) notice(res.warning, true);
+      else notice(`已导出 ${res.accounts} 个账号到 ${res.path}` +
+        (res.skipped ? `（跳过 ${res.skipped} 个）` : "") +
+        (res.webOnly ? `；${res.webOnly} 个 Platform Web token 无法用于 CPA，已跳过` : ""));
+    } catch (error) {
+      notice(error.message || "导出失败", true);
+    } finally {
+      setPoolBusyState(false);
+    }
   }
   async function refreshAccounts(payload) {
     if (poolBusy || busy) return;
@@ -830,6 +847,7 @@
     $("refreshAccounts").addEventListener("click", loadPool);
     $("refreshAllPool").addEventListener("click", () => refreshAccounts({ all: true }));
     $("syncProviders")?.addEventListener("click", syncProvidersNow);
+    $("exportCpa")?.addEventListener("click", exportCpaNow);
     $("refreshStatsQuota")?.addEventListener("click", () => refreshAccounts({ all: true, quotaOnly: true }));
     $("reloadStats")?.addEventListener("click", loadStats);
     window.addEventListener("focus", () => { loadPendingDraft(); });
