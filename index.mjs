@@ -78,6 +78,8 @@ export const GPTFreeGuiPlugin = async (ctx, options) => {
     const settings = await readAutoRefreshSettings().catch(() => ({ enabled: true }));
     if (settings.enabled) {
       autoRefresh = startAutoRefresh({
+        intervalMs: (settings.intervalMinutes || 60) * 60 * 1000,
+        leadMs: (settings.leadHours || 48) * 60 * 60 * 1000,
         getProxy: async () => (await readAutoRefreshSettings().catch(() => ({}))).proxy || "",
         onRenewed: () => connection.sync(),
         log: (level, message) => ctx?.client?.app?.log?.({

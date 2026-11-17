@@ -154,12 +154,15 @@ https://github.com/yang0/magpie-gptfree
 
 ## 自动续期
 
-插件加载后会在后台每 5 分钟扫一次号池：
+插件加载后会在后台每 **60 分钟**扫一次号池（只读本地加密文件，不发网络请求；可在 `auto-refresh.json` 里用 `intervalMinutes` 调整）：
 
-- token 已过期，或将在 **60 分钟**内过期 → 用账号的密码 + TOTP 自动重登，换新 token 并同步回 Magpie Providers；
-- 每轮最多处理 **6 个**账号，失败的账号 **30 分钟**后重试，避免连续打爆登录；
+- token 已过期，或将在 **48 小时**内过期 → 用账号的密码 + TOTP 自动重登，换新 token 并同步回 Magpie Providers；
+- 每轮批量按「待续期数量 ÷ 距离最早到期的剩余轮次」动态计算，上限 100：310 个号即使集中在 28 小时内到期，也能在到期前排完，不会按固定 6 个/轮拖到过期；
+- 失败的账号 **30 分钟**后重试；
 - 重登沿用「全部检测 / 刷新授权」上次填写的代理（保存在 `~/.magpie-gptfree/auto-refresh.json`）；
 - 请求路径上的 401/过期仍会即时重登，后台任务只是把"没人用就一直是死号"的空档补上。
+
+关于寿命：这批 Platform OAuth token 的 JWT `exp - iat` 实测全部是 **240 小时（10 天）**；官方 [SIWC 文档](https://developers.openai.com/siwc/token-sharing-open-source/token-reference) 写的是 access token 1 小时、refresh token 30 天，但那是 SIWC 流程，和这里的 Platform OAuth 不是同一套。按 48 小时提前量算，每个号大约每 8 天重登一次。
 
 关闭方式：在 `plugins.json` 的插件项里加 `"options": { "autoRefresh": false }`，或把 `auto-refresh.json` 的 `enabled` 改成 `false`。
 

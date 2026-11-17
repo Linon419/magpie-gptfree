@@ -25,7 +25,7 @@ function row(email, expSeconds) {
 test("auto refresh renews expired and near-expiry tokens, not fresh ones", async () => {
   const now = 1_800_000_000_000;
   const rows = [
-    row("fresh@example.com", Math.floor(now / 1000) + 5 * 3600),
+    row("fresh@example.com", Math.floor(now / 1000) + 72 * 3600),
     row("near@example.com", Math.floor(now / 1000) + 10 * 60),
     row("expired@example.com", Math.floor(now / 1000) - 60),
   ];
@@ -69,7 +69,7 @@ test("auto refresh caps work per tick and retries failures after backoff", async
       calls.push(account.email);
       if (account.email === "a@example.com") throw new Error("login failed");
       // Simulate the vault write: the renewed row is fresh on the next read.
-      account.accessToken = token(Math.floor(now / 1000) + 6 * 3600);
+      account.accessToken = token(Math.floor(now / 1000) + 240 * 3600);
       return account;
     },
   });
@@ -100,7 +100,7 @@ test("auto refresh does nothing when every token is fresh", async () => {
   const handle = startAutoRefresh({
     immediate: false,
     now: () => now,
-    read: async () => [row("fresh@example.com", Math.floor(now / 1000) + 7200)],
+    read: async () => [row("fresh@example.com", Math.floor(now / 1000) + 72 * 3600)],
     renew: async () => { calls++; },
   });
   try {
@@ -112,17 +112,51 @@ test("auto refresh does nothing when every token is fresh", async () => {
   }
 });
 
+test("a clustered 310-account pool drains before its tokens expire", async () => {
+  let now = 1_800_000_000_000;
+  const rows = Array.from({ length: 310 }, (_, i) => row(`u${i}@example.com`, Math.floor(now / 1000) + 6 * 3600));
+  const renewed = new Set();
+  const expiredBeforeRenew = [];
+  const handle = startAutoRefresh({
+    immediate: false,
+    now: () => now,
+    read: async () => rows,
+    intervalMs: 60 * 60 * 1000,
+    leadMs: 48 * 60 * 60 * 1000,
+    maxPerTick: 100,
+    renew: async (account) => {
+      const exp = JSON.parse(Buffer.from(account.accessToken.split(".")[1], "base64url").toString()).exp * 1000;
+      if (now >= exp) expiredBeforeRenew.push(account.email);
+      renewed.add(account.email);
+      account.accessToken = token(Math.floor(now / 1000) + 240 * 3600);
+      return account;
+    },
+  });
+  try {
+    for (let tick = 0; tick < 6; tick++) {
+      await handle.tick();
+      now += 60 * 60 * 1000;
+    }
+    assert.equal(renewed.size, 310);
+    assert.deepEqual(expiredBeforeRenew, []);
+  } finally {
+    handle.stop();
+  }
+});
+
 test("auto refresh settings round-trip the proxy and stay enabled by default", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gptfree-auto-"));
   try {
-    assert.deepEqual(await readAutoRefreshSettings({ root: dir }), { proxy: "", enabled: true });
-    await writeAutoRefreshSettings({ proxy: "http://127.0.0.1:7890" }, { root: dir });
     assert.deepEqual(await readAutoRefreshSettings({ root: dir }), {
-      proxy: "http://127.0.0.1:7890", enabled: true,
+      proxy: "", enabled: true, intervalMinutes: 60, leadHours: 48,
+    });
+    await writeAutoRefreshSettings({ proxy: "http://127.0.0.1:7890", intervalMinutes: 120 }, { root: dir });
+    assert.deepEqual(await readAutoRefreshSettings({ root: dir }), {
+      proxy: "http://127.0.0.1:7890", enabled: true, intervalMinutes: 120, leadHours: 48,
     });
     await writeAutoRefreshSettings({ enabled: false }, { root: dir });
     assert.deepEqual(await readAutoRefreshSettings({ root: dir }), {
-      proxy: "http://127.0.0.1:7890", enabled: false,
+      proxy: "http://127.0.0.1:7890", enabled: false, intervalMinutes: 120, leadHours: 48,
     });
   } finally {
     await rm(dir, { recursive: true, force: true });
