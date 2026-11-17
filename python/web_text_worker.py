@@ -245,6 +245,8 @@ class _DilScan:
     from the same position instead of re-rendering the whole message.
     """
 
+    # `out` holds one character per element so _DilRenderer can find the
+    # last non-whitespace character without splitting strings.
     __slots__ = ("i", "out", "in_code", "line_start")
 
     def __init__(self) -> None:
@@ -288,11 +290,11 @@ def _dil_scan(s: str, st: _DilScan, *, final: bool) -> None:
                 if end < 0:
                     if not final:
                         break
-                    out.append(s[i:])
+                    out.extend(s[i:])
                     i = n
                     break
                 in_code = not in_code
-                out.append(s[i:end + 1])
+                out.extend(s[i:end + 1])
                 i = end + 1
                 continue
             if not in_code and s.startswith("{@body", j):
@@ -319,11 +321,11 @@ def _dil_scan(s: str, st: _DilScan, *, final: bool) -> None:
             if close < 0:
                 if not final:
                     break
-                out.append(s[i:i + run])
+                out.extend(s[i:i + run])
                 i += run
                 line_start = False
                 continue
-            out.append(s[i:close + run])
+            out.extend(s[i:close + run])
             i = close + run
             line_start = False
             continue
@@ -365,36 +367,71 @@ def _dil_scan(s: str, st: _DilScan, *, final: bool) -> None:
     st.i, st.in_code, st.line_start = i, in_code, line_start
 
 
+_WS_ONLY_LINE = re.compile(r"\n[ \t]+(?=\n)")
+_EXTRA_BLANK_LINES = re.compile(r"\n{3,}")
+_WS = " \t\r\n"
+
+
+def _dil_normalize(text: str) -> str:
+    # Both rules only match runs of whitespace, so normalising two pieces
+    # split right after a non-whitespace character gives the same result
+    # as normalising them together. _DilRenderer relies on that.
+    return _EXTRA_BLANK_LINES.sub("\n\n", _WS_ONLY_LINE.sub("\n", text))
+
+
 def _dil_finish(out: list[str], *, final: bool) -> str:
-    result = "".join(out)
-    result = re.sub(r"\n[ \t]+(?=\n)", "\n", result)
-    result = re.sub(r"\n{3,}", "\n\n", result)
-    result = result.lstrip()
-    return result.rstrip() if final else result.rstrip(" \t\r\n")
+    result = _dil_normalize("".join(out)).lstrip()
+    return result.rstrip() if final else result.rstrip(_WS)
 
 
 class _DilRenderer:
-    """Incremental _dil_to_text for an append-only stream."""
+    """Incremental _dil_to_text for an append-only stream.
+
+    Output up to the last non-whitespace character can no longer change:
+    later tags only trim trailing indentation, and normalisation never
+    crosses a non-whitespace character. That part is normalised once and
+    cached, so each event normalises only the text it added.
+    """
 
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
         self.state = _DilScan()
-        self.consumed = ""
+        self.source_len = 0
+        self.source_tail = ""
+        self.flushed = 0
+        self.text = ""
+
+    def _is_continuation(self, s: str) -> bool:
+        # parts/0 only grows by appends; a replace shows up as a different
+        # length or a changed tail. Checking the tail keeps this O(1).
+        if len(s) < self.source_len:
+            return False
+        tail = self.source_tail
+        return s[self.source_len - len(tail):self.source_len] == tail
 
     def render(self, text: str, *, final: bool) -> str:
         s = str(text or "")
-        if not s.startswith(self.consumed):
-            # parts/0 was replaced rather than appended: start over.
+        if not self._is_continuation(s):
             self.reset()
         if final:
             st = self.state.copy()
             _dil_scan(s, st, final=True)
-            return _dil_finish(st.out, final=True)
+            rest = _dil_normalize("".join(st.out[self.flushed:]))
+            return (self.text + rest).strip() if self.text else rest.strip()
         _dil_scan(s, self.state, final=False)
-        self.consumed = s[:self.state.i]
-        return _dil_finish(self.state.out, final=False)
+        self.source_len = len(s)
+        self.source_tail = s[-64:]
+        out = self.state.out
+        end = len(out)
+        while end > self.flushed and out[end - 1] in _WS:
+            end -= 1
+        if end > self.flushed:
+            piece = _dil_normalize("".join(out[self.flushed:end]))
+            self.text = self.text + piece if self.text else piece.lstrip()
+            self.flushed = end
+        return self.text
 
 
 def _dil_to_text(text: str, *, final: bool = True) -> str:
@@ -496,7 +533,9 @@ class WebTextStreamTracker:
 
     def _clean(self, current: str, *, hold_partial_prefix: bool) -> str:
         raw = "\n\n".join(s for s in [*self.completed_segments, current] if s)
-        sanitized = _sanitize_output_text(raw)
+        # Citation markers are rare; a memchr-speed check avoids running the
+        # regex over the whole answer on every event.
+        sanitized = _sanitize_output_text(raw) if "\ue200" in raw else raw
         if not self.input_message_ids and self.assistant_history_messages:
             return strip_history_prefix(
                 sanitized,
