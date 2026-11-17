@@ -441,6 +441,24 @@ def _dil_to_text(text: str, *, final: bool = True) -> str:
     return _dil_finish(st.out, final=final)
 
 
+def _message_text_snapshot(message: dict[str, Any]) -> Optional[str]:
+    """Full text a message object carries, or None when it carries none.
+
+    Unlike _assistant_message_text this keeps "no text field" (None) apart
+    from "the text is empty" (""), which is a valid snapshot.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, dict):
+        return None
+    parts = content.get("parts")
+    if isinstance(parts, list):
+        return "".join(p for p in parts if isinstance(p, str))
+    text = content.get("text")
+    return text if isinstance(text, str) else None
+
+
 def _unescape_fallback(text: str) -> str:
     """Undo the punctuation escaping fallbackMarkdown adds (`\\:`, `\\.`)."""
     return re.sub(r"\\([.:!()\-])", r"\1", str(text or "")).strip()
@@ -636,8 +654,10 @@ class WebTextStreamTracker:
             and self.active_content_type not in {"thoughts", "reasoning_recap", "code"}
         ):
             self.last_patch_path = "/message/content/parts/0"
-            msg_text = _assistant_message_text(msg)
-            if msg_text and msg_text != self.current_msg_raw:
+            msg_text = _message_text_snapshot(msg)
+            # None means the message carried no text field; "" is a real
+            # snapshot of an empty body and must replace the old text.
+            if msg_text is not None and msg_text != self.current_msg_raw:
                 # A re-sent message carries the full text, which may differ
                 # anywhere, not only at the end.
                 self.current_msg_raw = msg_text

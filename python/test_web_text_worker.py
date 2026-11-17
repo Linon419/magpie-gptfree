@@ -694,6 +694,29 @@ class WebTextWorkerTests(unittest.TestCase):
                 tracker.finalize_delta()
                 self.assertNotIn("New heading", tracker.emitted_text)
 
+    def test_resent_empty_snapshot_replaces_text_then_appends(self) -> None:
+        def message(parts):
+            content = {"content_type": "text"}
+            if parts is not None:
+                content["parts"] = parts
+            return {"v": {"message": {"id": "m", "author": {"role": "assistant"},
+                    "content": content, "metadata": {"model_dil_v2": {}}}}}
+        tracker = web_text_worker.WebTextStreamTracker()
+        tracker.feed_payload(json.dumps(message(["<badge>Old</badge>"])))
+        generation = tracker.raw_generation
+        # Missing text field: nothing to replace.
+        tracker.feed_payload(json.dumps(message(None)))
+        self.assertEqual(tracker.current_msg_raw, "<badge>Old</badge>")
+        self.assertEqual(tracker.raw_generation, generation)
+        # Empty body: a valid snapshot that clears the text and the cache.
+        tracker.feed_payload(json.dumps(message([""])))
+        self.assertEqual(tracker.current_msg_raw, "")
+        self.assertGreater(tracker.raw_generation, generation)
+        self.assertEqual(tracker._current_candidates(final=True)[0][0], "")
+        tracker.feed_payload(json.dumps({"p": "/message/content/parts/0", "o": "append",
+                                         "v": "<badge>Old</badge> and more"}))
+        self.assertEqual(tracker._current_candidates(final=True)[0][0], "Old and more")
+
     def test_resent_identical_message_does_not_reset_rendering(self) -> None:
         tracker = web_text_worker.WebTextStreamTracker()
         message = {"v": {"message": {"id": "m", "author": {"role": "assistant"},
