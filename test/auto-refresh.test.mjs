@@ -183,10 +183,11 @@ test("the real timer retries a capped backlog after five minutes, not a full int
   let now = 1_800_000_000_000;
   const rows = Array.from({ length: 310 }, (_, i) => row(`t${i}@example.com`, Math.floor(now / 1000) + 40 * 3600));
   const calls = [];
+  let reads = 0;
   const handle = startAutoRefresh({
     immediate: false,
     now: () => now,
-    read: async () => rows,
+    read: async () => { reads++; return rows; },
     intervalMs: 24 * 60 * 60 * 1000,
     leadMs: 48 * 60 * 60 * 1000,
     maxPerTick: 100,
@@ -225,10 +226,18 @@ test("the real timer retries a capped backlog after five minutes, not a full int
     assert.equal(calls.length, 310);
     assert.equal(handle.stats.remaining, 0);
 
-    // Backlog drained: a five-minute tick must not renew anything again.
+    // Backlog drained: the scheduler is back on the 24h interval, so a
+    // five-minute tick must not even scan the vault.
+    const readsAfterDrain = reads;
     mock.timers.tick(5 * 60 * 1000);
     await flush();
     assert.equal(calls.length, 310);
+    assert.equal(reads, readsAfterDrain);
+
+    // The next scan happens when the normal interval elapses.
+    mock.timers.tick(24 * 60 * 60 * 1000);
+    await flush();
+    assert.equal(reads, readsAfterDrain + 1);
   } finally {
     handle.stop();
     mock.timers.reset();
