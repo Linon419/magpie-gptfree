@@ -341,8 +341,7 @@ class WebTextStreamTracker:
             if slug and self.active_role == "assistant":
                 self.model_slug = slug
             dil = op_v.get("model_dil_v2")
-            if isinstance(dil, dict):
-                self.active_has_dil = True
+            if isinstance(dil, dict) and self.active_has_dil:
                 if isinstance(dil.get("fallbackMarkdown"), str):
                     self.active_dil_fallback = dil["fallbackMarkdown"]
 
@@ -382,7 +381,12 @@ class WebTextStreamTracker:
                 self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
 
     def _apply_dil_op(self, path: str, op: Any, value: Any) -> None:
-        self.active_has_dil = True
+        # ChatGPT also patches model_dil_v2 onto plain-text responses *after*
+        # the message was created (observed on gpt-6-luna). Switching sources
+        # mid-stream breaks the delta prefix and truncates the answer, so only
+        # a message that declared model_dil_v2 at creation may use the fallback.
+        if not self.active_has_dil:
+            return
         if path.endswith("/fallbackMarkdown"):
             if op == "replace":
                 self.active_dil_fallback = str(value or "")
@@ -463,9 +467,15 @@ class WebTextStreamTracker:
         return self._next_delta(hold_partial_prefix=True)
 
     def finalize_delta(self) -> str:
-        if self.active_has_dil and not self.active_dil_fallback and self.current_msg_raw:
-            # No fallbackMarkdown arrived (older upstream): degrade to text.
-            self.active_dil_fallback = _dil_to_text(self.current_msg_raw)
+        if self.active_has_dil and self.current_msg_raw:
+            stripped = _dil_to_text(self.current_msg_raw)
+            if not self.active_dil_fallback:
+                # No fallbackMarkdown arrived (older upstream): degrade to text.
+                self.active_dil_fallback = stripped
+            elif stripped.startswith(self.active_dil_fallback) and len(stripped) > len(self.active_dil_fallback):
+                # The server stopped patching fallbackMarkdown early; the raw
+                # DIL still holds the rest of the answer.
+                self.active_dil_fallback = stripped
         return self._next_delta(hold_partial_prefix=False)
 
 

@@ -324,6 +324,58 @@ class WebTextWorkerTests(unittest.TestCase):
         self.assertEqual(visible_delta, "later")
         self.assertEqual(provisional.finalize_delta(), "")
 
+
+    def test_tracker_ignores_late_dil_metadata_on_plain_text(self) -> None:
+        # Observed on gpt-6-luna: the message is created as plain text, then
+        # model_dil_v2/fallbackMarkdown is patched in mid-stream. Switching to
+        # it broke the delta prefix and truncated the answer after a few chars.
+        tracker = web_text_worker.WebTextStreamTracker()
+        tracker.feed_payload(json.dumps({
+            "v": {"message": {
+                "id": "plain-1",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [""]},
+            }}
+        }))
+        emitted = []
+        emitted.append(tracker.feed_payload(json.dumps({
+            "p": "/message/content/parts/0", "o": "append", "v": "\\(正确答案：第",
+        })))
+        emitted.append(tracker.feed_payload(json.dumps({
+            "p": "/message/metadata/model_dil_v2/fallbackMarkdown",
+            "o": "append", "v": "(正确答案：第一项)",
+        })))
+        emitted.append(tracker.feed_payload(json.dumps({
+            "p": "/message/content/parts/0", "o": "append", "v": "一项)",
+        })))
+        tail = tracker.finalize_delta()
+        if tail:
+            emitted.append(tail)
+        self.assertEqual("".join(emitted), "\\(正确答案：第一项)")
+
+    def test_tracker_completes_partial_fallback_from_raw_dil(self) -> None:
+        # A DIL response whose fallbackMarkdown stops early must still return
+        # the rest of the answer from the raw DIL instead of truncating.
+        tracker = web_text_worker.WebTextStreamTracker()
+        tracker.feed_payload(json.dumps({
+            "v": {"message": {
+                "id": "dil-1",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [""]},
+                "metadata": {"model_dil_v2": {"fallbackMarkdown": ""}},
+            }}
+        }))
+        tracker.feed_payload(json.dumps({
+            "p": "/message/content/parts/0", "o": "append",
+            "v": "<box>(正确答案：第一项)</box>",
+        }))
+        tracker.feed_payload(json.dumps({
+            "p": "/message/metadata/model_dil_v2/fallbackMarkdown",
+            "o": "append", "v": "(正确答案：第",
+        }))
+        tracker.finalize_delta()
+        self.assertEqual(tracker.emitted_text, "(正确答案：第一项)")
+
     def test_end_to_end_stream_with_prepare_conduit_and_effort_fallback(self) -> None:
         conv_calls: list[dict] = []
 
