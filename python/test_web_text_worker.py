@@ -659,7 +659,52 @@ class WebTextWorkerTests(unittest.TestCase):
         # A replaced (not appended) parts/0 restarts cleanly.
         renderer = web_text_worker._DilRenderer()
         renderer.render("<box>old text</box>", final=False)
-        self.assertEqual(renderer.render("<box>new</box>", final=True), "new")
+        self.assertEqual(renderer.render("<box>new</box>", final=True, generation=1), "new")
+
+    def test_replace_that_keeps_length_and_last_64_chars_resets_rendering(self) -> None:
+        tail = "x" * 80 + " and the shared ending."
+        before = "<badge>Old heading</badge>\n\n" + tail
+        after = "<badge>New heading</badge>\n\n" + tail
+        self.assertEqual(len(before), len(after))
+        self.assertEqual(before[-64:], after[-64:])
+        for replace in [
+            {"p": "/message/content/parts/0", "o": "replace", "v": after},
+            {"o": "patch", "v": [{"p": "/message/content/parts/0", "o": "replace", "v": after}]},
+            {"v": {"message": {"id": "m", "author": {"role": "assistant"},
+                               "content": {"content_type": "text", "parts": [after]},
+                               "metadata": {"model_dil_v2": {}}}}},
+        ]:
+            with self.subTest(replace=replace):
+                tracker = web_text_worker.WebTextStreamTracker()
+                tracker.feed_payload(json.dumps({"v": {"message": {
+                    "id": "m", "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": [""]},
+                    "metadata": {"model_dil_v2": {}},
+                }}}))
+                tracker.feed_payload(json.dumps({"p": "/message/content/parts/0", "o": "append", "v": before}))
+                self.assertTrue(tracker.emitted_text.startswith("Old heading"))
+                generation = tracker.raw_generation
+                tracker.feed_payload(json.dumps(replace))
+                self.assertGreater(tracker.raw_generation, generation)
+                current = tracker._current_candidates(final=True)[0][0]
+                self.assertEqual(current, web_text_worker._dil_to_text(after))
+                self.assertTrue(current.startswith("New heading"))
+                # Already-emitted text cannot be recalled, so nothing that
+                # contradicts it is appended either.
+                tracker.finalize_delta()
+                self.assertNotIn("New heading", tracker.emitted_text)
+
+    def test_resent_identical_message_does_not_reset_rendering(self) -> None:
+        tracker = web_text_worker.WebTextStreamTracker()
+        message = {"v": {"message": {"id": "m", "author": {"role": "assistant"},
+                   "content": {"content_type": "text", "parts": ["<badge>Same</badge>"]},
+                   "metadata": {"model_dil_v2": {}}}}}
+        tracker.feed_payload(json.dumps(message))
+        generation = tracker.raw_generation
+        tracker.feed_payload(json.dumps(message))
+        self.assertEqual(tracker.raw_generation, generation)
+        tracker.finalize_delta()
+        self.assertEqual(tracker.emitted_text, "Same")
 
     def test_end_to_end_stream_with_prepare_conduit_and_effort_fallback(self) -> None:
         conv_calls: list[dict] = []

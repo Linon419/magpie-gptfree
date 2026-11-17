@@ -399,22 +399,17 @@ class _DilRenderer:
     def reset(self) -> None:
         self.state = _DilScan()
         self.source_len = 0
-        self.source_tail = ""
+        self.generation = 0
         self.flushed = 0
         self.text = ""
 
-    def _is_continuation(self, s: str) -> bool:
-        # parts/0 only grows by appends; a replace shows up as a different
-        # length or a changed tail. Checking the tail keeps this O(1).
-        if len(s) < self.source_len:
-            return False
-        tail = self.source_tail
-        return s[self.source_len - len(tail):self.source_len] == tail
-
-    def render(self, text: str, *, final: bool) -> str:
+    def render(self, text: str, *, final: bool, generation: int = 0) -> str:
+        """`generation` changes whenever the caller replaced (not appended
+        to) the source; the cached scan is only valid for one generation."""
         s = str(text or "")
-        if not self._is_continuation(s):
+        if generation != self.generation or len(s) < self.source_len:
             self.reset()
+            self.generation = generation
         if final:
             st = self.state.copy()
             _dil_scan(s, st, final=True)
@@ -422,7 +417,6 @@ class _DilRenderer:
             return (self.text + rest).strip() if self.text else rest.strip()
         _dil_scan(s, self.state, final=False)
         self.source_len = len(s)
-        self.source_tail = s[-64:]
         out = self.state.out
         end = len(out)
         while end > self.flushed and out[end - 1] in _WS:
@@ -487,6 +481,9 @@ class WebTextStreamTracker:
     active_has_dil: bool = False
     pending_delta: str = ""
     turn_complete: bool = False
+    # Bumped whenever parts/0 is replaced rather than appended to, so the
+    # incremental DIL renderer knows its cached scan is stale.
+    raw_generation: int = 0
     dil_renderer: _DilRenderer = field(default_factory=_DilRenderer, repr=False, compare=False)
     blocked: bool = False
     model_slug: str = ""
@@ -525,7 +522,7 @@ class WebTextStreamTracker:
         raw = self.current_msg_raw
         if not self.active_has_dil:
             return [(raw, True)]
-        candidates = [(self.dil_renderer.render(raw, final=final), True)]
+        candidates = [(self.dil_renderer.render(raw, final=final, generation=self.raw_generation), True)]
         if final and self.dil_fallback_buffer:
             candidates.append((_unescape_fallback(self.dil_fallback_buffer), True))
         candidates.append((raw, False))
@@ -640,8 +637,11 @@ class WebTextStreamTracker:
         ):
             self.last_patch_path = "/message/content/parts/0"
             msg_text = _assistant_message_text(msg)
-            if msg_text:
+            if msg_text and msg_text != self.current_msg_raw:
+                # A re-sent message carries the full text, which may differ
+                # anywhere, not only at the end.
                 self.current_msg_raw = msg_text
+                self.raw_generation += 1
         else:
             self.last_patch_path = ""
 
@@ -708,7 +708,7 @@ class WebTextStreamTracker:
                 # Recorded even while hidden: a provisional message may become
                 # visible later; _current_candidates gates the output.
                 if not self.active_is_input_echo and isinstance(op_v, (str, int, float)):
-                    self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
+                    self._patch_raw(op)
                 return
             if op_p.startswith("/message/metadata/model_dil_v2"):
                 # Compact patches omit p after an explicit path. Keep DIL
@@ -730,7 +730,14 @@ class WebTextStreamTracker:
             if self.last_patch_path == "/message/metadata/model_dil_v2/fallbackMarkdown":
                 self._apply_dil_op(self.last_patch_path, op_o, op_v)
             elif not self.active_is_input_echo and self.last_patch_path == "/message/content/parts/0":
-                self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
+                self._patch_raw(op)
+
+    def _patch_raw(self, op: dict[str, Any]) -> None:
+        if op.get("o") == "append":
+            self.current_msg_raw += str(op.get("v") or "")
+        elif op.get("o") == "replace":
+            self.current_msg_raw = str(op.get("v") or "")
+            self.raw_generation += 1
 
     def _set_dil_fallback(self, text: str) -> None:
         # Any model_dil_v2 metadata marks the message as DIL, even when it is
