@@ -4,7 +4,10 @@
  * Primary import & management live in the left-sidebar page (GPT号池).
  */
 import { CODEX_BASE, discoverPoolModels, poolFetch } from "./lib/codex-pool.mjs";
-import { GUI_PORT, startGuiServer } from "./lib/gui-service.mjs";
+import { GUI_PORT, startGuiServer, startGuiServerWithRetry } from "./lib/gui-service.mjs";
+import { configureTextCooldownStore } from "./lib/chatgpt-web-text.mjs";
+import { poolDir } from "./lib/pool-vault.mjs";
+import { join } from "node:path";
 import { createPoolConnector, POOL_MARKER, POOL_PROVIDER } from "./lib/pool-connection.mjs";
 import { nativeImportMethod } from "./lib/provider-native-signin.mjs";
 import { readAutoRefreshSettings, startAutoRefresh } from "./lib/auto-refresh.mjs";
@@ -13,6 +16,7 @@ let sharedClient = null;
 let sharedConnector = null;
 let sharedActiveKey = null;
 let autoRefresh = null;
+let guiRetry = null;
 
 function ensurePoolConnector(ctx) {
   if (typeof ctx?.magpie?.account === "function") {
@@ -41,27 +45,32 @@ export const GPTFreeGuiPlugin = async (ctx, options) => {
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535)
     throw new Error("GPT号池 GUI: invalid service port");
   const connection = ensurePoolConnector(ctx) || createPoolConnector(ctx.client);
-  try {
-    await startGuiServer({ port, onPoolChange: () => connection.sync() });
-  } catch (error) {
-    // The GUI port is normally held by the previous host, which is still
-    // shutting down: a host restart overlaps the two for a moment. The
-    // pool's provider side does not need the GUI service, so the plugin
-    // keeps loading and its models hook stays registered. Letting this
-    // throw failed the whole plugin load, which left the provider with no
-    // endpoint at all ("GPT号池 has no endpoint configured") until the
-    // port was freed by hand.
-    const message = "GPT号池 GUI service could not start (" +
-      String(error?.message || error) + "); the pool provider stays available, " +
-      "the sidebar page is unavailable until the port is free";
-    try {
-      await ctx?.client?.app?.log?.({
-        body: { service: "gptfree", level: "warn", message },
-      });
-    } catch {
-      // A log that cannot be written must not stop the plugin from loading.
-    }
+  // The GUI port is normally held by the previous host, which is still
+  // shutting down (a host restart overlaps the two for a moment), and an
+  // older Magpie instance can hold it for longer. The pool's provider side
+  // does not need the GUI service, so the plugin keeps loading and the page
+  // comes back by itself once the port is free.
+  const log = (level, message) => Promise.resolve(ctx?.client?.app?.log?.({
+    body: { service: "gptfree", level, message },
+  })).catch(() => {});
+  if (!guiRetry) {
+    let warned = false;
+    guiRetry = startGuiServerWithRetry({
+      port,
+      onPoolChange: () => connection.sync(),
+      onWaiting: (error, delay) => {
+        if (warned) return;
+        warned = true;
+        void log("warn", "GPT号池 GUI service could not start (" +
+          String(error?.message || error) + "); the pool provider stays available, " +
+          "retrying every " + Math.round(delay / 1000) + "s+ until the port is free");
+      },
+      onStarted: () => {
+        if (warned) void log("info", "GPT号池 GUI service started on 127.0.0.1:" + port);
+      },
+    });
   }
+  await guiRetry.first;
   // Restore Magpie's per-account local-pool slots automatically after
   // restarting. A corrupt vault must not make the GUI inaccessible.
   try {
@@ -98,6 +107,10 @@ export const GPTFreeGuiPlugin = async (ctx, options) => {
  */
 export const GPTFreePoolPlugin = async (ctx = {}) => {
   const connector = ensurePoolConnector(ctx);
+  // Keep text 429 cooldowns across plugin-host restarts. Tests run without
+  // it so they never write into the real pool directory.
+  if (!process.env.NODE_TEST_CONTEXT)
+    configureTextCooldownStore({ file: join(poolDir(), "text-cooldowns.json") });
   return {
     config: async (cfg) => {
       cfg.provider ??= {};
