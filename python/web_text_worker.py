@@ -341,9 +341,8 @@ class WebTextStreamTracker:
             if slug and self.active_role == "assistant":
                 self.model_slug = slug
             dil = op_v.get("model_dil_v2")
-            if isinstance(dil, dict) and self.active_has_dil:
-                if isinstance(dil.get("fallbackMarkdown"), str):
-                    self.active_dil_fallback = dil["fallbackMarkdown"]
+            if isinstance(dil, dict) and isinstance(dil.get("fallbackMarkdown"), str):
+                self._adopt_dil_fallback(dil["fallbackMarkdown"])
 
     def _handle_patch_op(self, op: dict[str, Any], *, apply_visibility: bool = True) -> None:
         op_p = op.get("p")
@@ -380,21 +379,36 @@ class WebTextStreamTracker:
             if self._is_active_visible() and self.last_patch_path == "/message/content/parts/0":
                 self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
 
-    def _apply_dil_op(self, path: str, op: Any, value: Any) -> None:
-        # ChatGPT also patches model_dil_v2 onto plain-text responses *after*
-        # the message was created (observed on gpt-6-luna). Switching sources
-        # mid-stream breaks the delta prefix and truncates the answer, so only
-        # a message that declared model_dil_v2 at creation may use the fallback.
-        if not self.active_has_dil:
+    def _adopt_dil_fallback(self, candidate: str) -> None:
+        """Adopt a fallbackMarkdown value, including late metadata.
+
+        ChatGPT also patches model_dil_v2 onto plain-text responses *after*
+        the message was created (observed on gpt-6-luna). Adopting a fallback
+        that disagrees with what was already emitted stalls the delta prefix
+        and truncates the answer, so a late fallback is only taken when it
+        continues the emitted text (or lags behind it). A fallback declared at
+        message creation is authoritative.
+        """
+        text = str(candidate or "")
+        if self.active_has_dil:
+            self.active_dil_fallback = text
             return
+        emitted = self.emitted_text
+        if emitted and not (text.startswith(emitted) or emitted.startswith(text)):
+            return
+        self.active_has_dil = True
+        self.active_dil_fallback = text
+
+    def _apply_dil_op(self, path: str, op: Any, value: Any) -> None:
         if path.endswith("/fallbackMarkdown"):
             if op == "replace":
-                self.active_dil_fallback = str(value or "")
+                self._adopt_dil_fallback(value)
             elif op == "append":
-                self.active_dil_fallback += str(value or "")
+                current = self.active_dil_fallback if self.active_has_dil else ""
+                self._adopt_dil_fallback(current + str(value or ""))
         elif path == "/message/metadata/model_dil_v2" and isinstance(value, dict):
             if isinstance(value.get("fallbackMarkdown"), str):
-                self.active_dil_fallback = value["fallbackMarkdown"]
+                self._adopt_dil_fallback(value["fallbackMarkdown"])
 
     def _handle_patch_list(self, items: list[Any]) -> None:
         dict_items = [item for item in items if isinstance(item, dict)]

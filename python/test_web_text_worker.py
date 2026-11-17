@@ -353,6 +353,31 @@ class WebTextWorkerTests(unittest.TestCase):
             emitted.append(tail)
         self.assertEqual("".join(emitted), "\\(正确答案：第一项)")
 
+
+    def test_tracker_accepts_late_dil_fallback_when_it_extends_prefix(self) -> None:
+        # Raw parts stop early and the rest of the answer only arrives through
+        # late fallbackMarkdown: ignoring it would truncate the reply.
+        tracker = web_text_worker.WebTextStreamTracker()
+        tracker.feed_payload(json.dumps({
+            "v": {"message": {
+                "id": "late-1",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [""]},
+            }}
+        }))
+        emitted = []
+        emitted.append(tracker.feed_payload(json.dumps({
+            "p": "/message/content/parts/0", "o": "append", "v": "(正确答案：第",
+        })))
+        emitted.append(tracker.feed_payload(json.dumps({
+            "p": "/message/metadata/model_dil_v2/fallbackMarkdown",
+            "o": "append", "v": "(正确答案：第一项)",
+        })))
+        tail = tracker.finalize_delta()
+        if tail:
+            emitted.append(tail)
+        self.assertEqual("".join(emitted), "(正确答案：第一项)")
+
     def test_tracker_completes_partial_fallback_from_raw_dil(self) -> None:
         # A DIL response whose fallbackMarkdown stops early must still return
         # the rest of the answer from the raw DIL instead of truncating.
