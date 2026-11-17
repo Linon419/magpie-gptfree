@@ -7,10 +7,12 @@ import { CODEX_BASE, discoverPoolModels, poolFetch } from "./lib/codex-pool.mjs"
 import { GUI_PORT, startGuiServer } from "./lib/gui-service.mjs";
 import { createPoolConnector, POOL_MARKER, POOL_PROVIDER } from "./lib/pool-connection.mjs";
 import { nativeImportMethod } from "./lib/provider-native-signin.mjs";
+import { readAutoRefreshSettings, startAutoRefresh } from "./lib/auto-refresh.mjs";
 
 let sharedClient = null;
 let sharedConnector = null;
 let sharedActiveKey = null;
+let autoRefresh = null;
 
 function ensurePoolConnector(ctx) {
   if (typeof ctx?.magpie?.account === "function") {
@@ -69,6 +71,20 @@ export const GPTFreeGuiPlugin = async (ctx, options) => {
       body: { service: "gptfree", level: "warn",
         message: "Could not restore local account-pool state; inspect GUI pool storage" },
     }).catch(() => {});
+  }
+  // Renew tokens before they expire instead of waiting for the next 401.
+  // `autoRefresh: false` in the plugin options turns it off.
+  if (options?.autoRefresh !== false && !autoRefresh) {
+    const settings = await readAutoRefreshSettings().catch(() => ({ enabled: true }));
+    if (settings.enabled) {
+      autoRefresh = startAutoRefresh({
+        getProxy: async () => (await readAutoRefreshSettings().catch(() => ({}))).proxy || "",
+        onRenewed: () => connection.sync(),
+        log: (level, message) => ctx?.client?.app?.log?.({
+          body: { service: "gptfree", level, message },
+        }),
+      });
+    }
   }
   return {};
 };

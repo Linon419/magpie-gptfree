@@ -141,7 +141,7 @@ https://github.com/yang0/magpie-gptfree
 
 ## 导出到 CPA（CLIProxyAPI）
 
-「我的账号池」右上角有 **导出到 CPA**：把号池里的账号打包成 CLIProxyAPI 能读的 Codex 认证文件（`codex-<邮箱>.json`），ZIP 保存在：
+「我的账号池」右上角有 **导出到 CPA**：把号池里 **Codex 可用**的账号打包成 CLIProxyAPI 的 Codex 认证文件（`codex-<邮箱>.json`），ZIP 保存在：
 
 ```
 ~/.magpie-gptfree/exports/gptfree-cpa-<时间>.zip
@@ -150,7 +150,18 @@ https://github.com/yang0/magpie-gptfree
 导入 CPA：管理页 **Auth Files** 上传，或 `POST /v0/management/auth-files?name=<文件名>`，或解压到 CPA 的 `auth-dir`。压缩包里附一份 `README.txt`。
 
 > [!WARNING]
-> 号池只保存 Platform access_token，导出文件里的 `refresh_token` 为空：CPA 能用这些号直到 token 过期（当前批次大约 5–7 天），但无法自动续期，到期后重新导出即可。ZIP 里是明文凭证，只放本机或可信的 CPA 实例。
+> 已实测（2026-11-17）：ChatGPT **Platform Web token** 只能读取 `/codex/models`，对 `/codex/responses` 实际生成请求返回 **401 Unauthorized**，所以这类账号**不会**被导出（按钮会提示跳过数量）。只有 Codex 侧可用的 token 才会生成文件；文件里没有 `refresh_token`，CPA 无法自动续期。ZIP 含明文凭证，只放本机或可信 CPA。
+
+## 自动续期
+
+插件加载后会在后台每 5 分钟扫一次号池：
+
+- token 已过期，或将在 **60 分钟**内过期 → 用账号的密码 + TOTP 自动重登，换新 token 并同步回 Magpie Providers；
+- 每轮最多处理 **6 个**账号，失败的账号 **30 分钟**后重试，避免连续打爆登录；
+- 重登沿用「全部检测 / 刷新授权」上次填写的代理（保存在 `~/.magpie-gptfree/auto-refresh.json`）；
+- 请求路径上的 401/过期仍会即时重登，后台任务只是把"没人用就一直是死号"的空档补上。
+
+关闭方式：在 `plugins.json` 的插件项里加 `"options": { "autoRefresh": false }`，或把 `auto-refresh.json` 的 `enabled` 改成 `false`。
 
 ## 免责声明
 
