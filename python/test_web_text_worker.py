@@ -470,6 +470,45 @@ class WebTextWorkerTests(unittest.TestCase):
                 self.assertEqual("".join(output), "Answer complete")
                 self.assertEqual(tracker.current_msg_raw, "Answer")
 
+    def test_compact_string_continuations_inside_patch_lists(self) -> None:
+        for path, initial in [
+            ("/message/content/parts/0", ""),
+            ("/message/metadata/model_dil_v2/fallbackMarkdown", "Answer"),
+        ]:
+            for compact in [{"v": " complete"}, {"o": "append", "v": " complete"}]:
+                with self.subTest(path=path, compact=compact):
+                    tracker = web_text_worker.WebTextStreamTracker()
+                    output = [tracker.feed_payload(json.dumps({"message": {
+                        "id": "a", "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": [initial]},
+                    }}))]
+                    output.append(tracker.feed_payload(json.dumps({"o": "patch", "v": [
+                        {"p": path, "o": "append", "v": "Answer"}, compact,
+                    ]})))
+                    output.append(tracker.finalize_delta())
+                    self.assertEqual("".join(output), "Answer complete")
+                    if "fallbackMarkdown" in path:
+                        self.assertEqual(tracker.current_msg_raw, "Answer")
+                        self.assertEqual(tracker.dil_fallback_buffer, "Answer complete")
+
+    def test_compact_patch_list_keeps_hidden_text_and_dil_code_silent(self) -> None:
+        for path, hidden in [
+            ("/message/metadata/model_dil_v2/fallbackMarkdown", True),
+            ("/message/metadata/model_dil_v2/code", False),
+        ]:
+            with self.subTest(path=path):
+                tracker = web_text_worker.WebTextStreamTracker()
+                output = [tracker.feed_payload(json.dumps({"message": {
+                    "id": "a", "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": [""]},
+                    "metadata": {"is_visually_hidden_from_conversation": hidden},
+                }}))]
+                output.append(tracker.feed_payload(json.dumps({"o": "patch", "v": [
+                    {"p": path, "o": "append", "v": "internal"}, {"v": " What"},
+                ]})))
+                output.append(tracker.finalize_delta())
+                self.assertEqual("".join(output), "")
+
     def test_dil_constants_do_not_become_answer_text(self) -> None:
         for path in ["constants/0", "code"]:
             with self.subTest(path=path):

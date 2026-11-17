@@ -356,6 +356,11 @@ class WebTextStreamTracker:
         op_p = op.get("p")
         op_o = op.get("o")
         op_v = op.get("v")
+        # A compact string continuation can omit both p and o, including
+        # inside a patch list. Normalize it here for every entry point.
+        if "p" not in op and "o" not in op and isinstance(op_v, str):
+            op_o = "append"
+            op = {**op, "o": op_o}
 
         if op_p == "" and op_o == "add" and isinstance(op_v, dict) and isinstance(op_v.get("message"), dict):
             self._handle_message(op_v["message"])
@@ -496,7 +501,7 @@ class WebTextStreamTracker:
         elif isinstance(val, list):
             self._handle_patch_list(val)
         elif isinstance(val, str) and "p" not in event and event.get("o") in (None, "append", "replace"):
-            self._handle_patch_op({"o": event.get("o") or "append", "v": val})
+            self._handle_patch_op(event)
 
         return self._next_delta(hold_partial_prefix=True)
 
