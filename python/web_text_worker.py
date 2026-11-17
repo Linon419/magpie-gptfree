@@ -157,14 +157,164 @@ def _is_hidden_text_path(path: str) -> bool:
     )
 
 
-def _dil_to_text(text: str) -> str:
-    """Crude DIL -> text fallback for upstreams that send no fallbackMarkdown."""
+_DIL_TAG_NAME = re.compile(r"[A-Za-z][\w.-]*")
+_MAX_DIL_TAG = 4000
+
+
+def _scan_dil_tag(s: str, i: int) -> Any:
+    """Scan a component tag starting at s[i] == "<".
+
+    Returns (end, name, closing, self_closing), None when the tag is not
+    finished yet, or -1 when the "<" is ordinary text. Attribute values may
+    hold JS (`onClick={()=>...}`), so ">" only ends the tag outside braces
+    and quotes.
+    """
+    n = len(s)
+    j = i + 1
+    closing = j < n and s[j] == "/"
+    if closing:
+        j += 1
+    if j >= n:
+        return None
+    m = _DIL_TAG_NAME.match(s, j)
+    if not m:
+        return -1
+    name = m.group(0)
+    j = m.end()
+    if j >= n:
+        return None
+    if s[j] not in " \t\r\n/>":
+        return -1
+    depth = 0
+    quote = ""
+    while j < n:
+        if j - i > _MAX_DIL_TAG:
+            return -1
+        c = s[j]
+        if quote:
+            if c == "\\":
+                j += 2
+                continue
+            if c == quote:
+                quote = ""
+        elif c in "\"'`" and (depth > 0 or s[j - 1] == "="):
+            quote = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and c == ">":
+            return j + 1, name, closing, s[j - 1] == "/"
+        elif depth == 0 and (c == "<" or s.startswith("\n\n", j)):
+            return -1
+        j += 1
+    return None
+
+
+def _dil_to_text(text: str, *, final: bool = True) -> str:
+    """Render DIL (Markdown + component tags + {@body} JS) as plain Markdown.
+
+    Runs on every streamed prefix: with final=False an unfinished tag,
+    control block, fence line or trailing whitespace is held back instead of
+    being emitted, so each result is a prefix of the next one. Fenced code
+    is copied verbatim; AppBlock apps are dropped whole.
+    """
     s = str(text or "")
-    s = re.sub(r"(?m)^\s*\{@body[^\n]*\}\s*$", "", s)
-    s = re.sub(r"\{#[^}]*\}|\{:[^}]*\}|\{/[^}]*\}", "", s)
-    s = re.sub(r"<[^>\n]+>", "", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+    n = len(s)
+    out: list[str] = []
+    i = 0
+    in_code = False
+    line_start = True
+
+    def trim_indent_after_tag() -> None:
+        # "  <box>" lines would otherwise leave indentation that Markdown
+        # reads as a code block.
+        k = len(out)
+        while k and out[k - 1] in " \t":
+            k -= 1
+        if k == 0 or out[k - 1] == "\n":
+            del out[k:]
+
+    while i < n:
+        if line_start:
+            j = i
+            while j < n and s[j] in " \t":
+                j += 1
+            if s.startswith("```", j) or s.startswith("~~~", j):
+                end = s.find("\n", j)
+                if end < 0:
+                    if not final:
+                        break
+                    out.append(s[i:])
+                    i = n
+                    break
+                in_code = not in_code
+                out.append(s[i:end + 1])
+                i = end + 1
+                continue
+            if not in_code and (s.startswith("{@body", j) or (j < n and not final and "{@body".startswith(s[j:]))):
+                end = s.find("\n", j)
+                if end < 0:
+                    i = n
+                    break
+                i = end + 1
+                continue
+        c = s[i]
+        if in_code:
+            out.append(c)
+            line_start = c == "\n"
+            i += 1
+            continue
+        if c == "{" and (i + 1 >= n or s[i + 1] in "#:/"):
+            if i + 1 >= n:
+                if not final:
+                    break
+                out.append(c)
+                i += 1
+                continue
+            end = s.find("}", i)
+            if end < 0:
+                if not final:
+                    break
+                i = n
+                break
+            i = end + 1
+            line_start = False
+            continue
+        if c == "<":
+            tag = _scan_dil_tag(s, i)
+            if tag is None:
+                if not final:
+                    break
+                i = n
+                break
+            if tag != -1:
+                end, name, closing, self_closing = tag
+                if name == "AppBlock" and not closing and not self_closing:
+                    close = s.find("</AppBlock>", end)
+                    if close < 0:
+                        if not final:
+                            break
+                        i = n
+                        break
+                    end = close + len("</AppBlock>")
+                trim_indent_after_tag()
+                i = end
+                continue
+        out.append(c)
+        line_start = c == "\n"
+        i += 1
+
+    result = "".join(out)
+    result = re.sub(r"\n[ \t]+(?=\n)", "\n", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    result = result.lstrip()
+    return result.rstrip() if final else result.rstrip(" \t\r\n")
+
+
+def _unescape_fallback(text: str) -> str:
+    """Undo the punctuation escaping fallbackMarkdown adds (`\\:`, `\\.`)."""
+    return re.sub(r"\\([.:!()\-])", r"\1", str(text or "")).strip()
 
 
 def _infer_sse_error_status(code: str, message: str) -> int:
@@ -198,9 +348,10 @@ class WebTextStreamTracker:
     current_msg_raw: str = ""
     last_patch_path: str = "/message/content/parts/0"
     emitted_text: str = ""
-    active_dil_fallback: str = ""
     dil_fallback_buffer: str = ""
     active_has_dil: bool = False
+    pending_delta: str = ""
+    turn_complete: bool = False
     blocked: bool = False
     model_slug: str = ""
 
@@ -219,40 +370,83 @@ class WebTextStreamTracker:
             return False
         return True
 
-    def _current_visible_text(self) -> str:
-        # GPT-6 "Intelligent UI" responses stream DIL markup in parts/0; the
-        # server also streams a plain-Markdown fallbackMarkdown for clients
-        # that cannot render it. Prefer the fallback so downstream clients
-        # never receive raw <box>/<text> component tags.
-        #
-        # The fallback must go through the same visibility gate as parts/0:
-        # hidden, reasoning and tool-directed messages can also carry
-        # model_dil_v2, and their text must never reach the caller.
+    def _current_candidates(self, *, final: bool) -> list[tuple[str, bool]]:
+        """Text sources for the active message, best first: (text, rendered).
+
+        GPT-6 "Intelligent UI" responses stream DIL (Markdown + <badge>,
+        <box>, {@body ...}) in parts/0. That raw text holds the whole answer,
+        so it is rendered to Markdown as it streams. The server's
+        fallbackMarkdown is escaped differently and omits computed content
+        (observed: "(Correct answer)" then a stall), so it is only a final
+        completion candidate. Raw parts/0 is the last resort, for a DIL flag
+        that arrived after tags were already emitted.
+
+        Every source passes the same visibility gate: hidden, reasoning and
+        tool-directed messages can carry model_dil_v2 too.
+        """
         if not self._is_active_visible():
-            return ""
-        if self.active_has_dil:
-            return self.active_dil_fallback
-        return self.current_msg_raw
+            return [("", True)]
+        raw = self.current_msg_raw
+        if not self.active_has_dil:
+            return [(raw, True)]
+        candidates = [(_dil_to_text(raw, final=final), True)]
+        if final and self.dil_fallback_buffer:
+            candidates.append((_unescape_fallback(self.dil_fallback_buffer), True))
+        candidates.append((raw, False))
+        return candidates
 
-    def _combined_sanitized(self) -> str:
-        raw = "\n\n".join(s for s in [*self.completed_segments, self._current_visible_text()] if s)
-        return _sanitize_output_text(raw)
-
-    def _next_delta(self, *, hold_partial_prefix: bool) -> str:
-        sanitized = self._combined_sanitized()
+    def _clean(self, current: str, *, hold_partial_prefix: bool) -> str:
+        raw = "\n\n".join(s for s in [*self.completed_segments, current] if s)
+        sanitized = _sanitize_output_text(raw)
         if not self.input_message_ids and self.assistant_history_messages:
-            clean = strip_history_prefix(
+            return strip_history_prefix(
                 sanitized,
                 self.assistant_history_messages,
                 hold_partial_prefix=hold_partial_prefix,
             )
-        else:
-            clean = sanitized
-        if len(clean) > len(self.emitted_text) and clean.startswith(self.emitted_text):
-            delta = clean[len(self.emitted_text) :]
+        return sanitized
+
+    def _pick_current(self, *, final: bool) -> tuple[str, str]:
+        """Choose the source that continues what was already emitted.
+
+        Streaming takes the first consistent source, so rendered DIL never
+        falls through to raw tags while a tag is still incomplete. At the end
+        the longest consistent rendered source wins, letting a fallback
+        complete an answer whose raw text stopped early.
+        """
+        consistent = []
+        for text, rendered in self._current_candidates(final=final):
+            clean = self._clean(text, hold_partial_prefix=not final)
+            if clean.startswith(self.emitted_text):
+                consistent.append((text, clean, rendered))
+        if not consistent:
+            return "", self.emitted_text
+        if final:
+            rendered = [c for c in consistent if c[2]]
+            if rendered:
+                best = max(rendered, key=lambda c: len(c[1]))
+                return best[0], best[1]
+        return consistent[0][0], consistent[0][1]
+
+    def _next_delta(self, *, hold_partial_prefix: bool) -> str:
+        _, clean = self._pick_current(final=not hold_partial_prefix)
+        delta = ""
+        if len(clean) > len(self.emitted_text):
+            delta = clean[len(self.emitted_text):]
             self.emitted_text = clean
-            return delta
-        return ""
+        pending, self.pending_delta = self.pending_delta, ""
+        return pending + delta
+
+    def _finish_current_message(self) -> None:
+        """Flush the active message before switching to the next one."""
+        if not self._is_active_visible():
+            return
+        text, clean = self._pick_current(final=True)
+        if len(clean) > len(self.emitted_text):
+            self.pending_delta += clean[len(self.emitted_text):]
+            self.emitted_text = clean
+        if text:
+            self.completed_segments.append(text)
 
     def _handle_message(self, msg: dict[str, Any]) -> None:
         msg_id = str(msg.get("id") or "")
@@ -276,13 +470,11 @@ class WebTextStreamTracker:
         is_new_message = bool(msg_id) and msg_id != self.current_msg_id
         previous_visible = self._is_active_visible()
         if is_new_message:
-            visible_text = self._current_visible_text()
-            if previous_visible and visible_text:
-                self.completed_segments.append(visible_text)
+            if previous_visible:
+                self._finish_current_message()
             self.current_msg_id = msg_id
             self.current_msg_raw = ""
             self.active_has_dil = False
-            self.active_dil_fallback = ""
             self.dil_fallback_buffer = ""
 
         self.active_is_input_echo = False
@@ -293,17 +485,9 @@ class WebTextStreamTracker:
         self.active_hidden = metadata.get("is_visually_hidden_from_conversation") is True
         dil = metadata.get("model_dil_v2")
         if isinstance(dil, dict):
-            if is_new_message:
-                self.active_has_dil = True
-                self.active_dil_fallback = str(dil.get("fallbackMarkdown") or "")
-                self.dil_fallback_buffer = self.active_dil_fallback
-            elif isinstance(dil.get("fallbackMarkdown"), str):
-                self._set_dil_fallback(dil["fallbackMarkdown"])
-        elif is_new_message:
-            # A re-sent message without model_dil_v2 must not clear an active
-            # fallback; only a genuinely new message starts a new text source.
-            self.active_has_dil = False
-            self.active_dil_fallback = ""
+            self.active_has_dil = True
+            if isinstance(dil.get("fallbackMarkdown"), str):
+                self.dil_fallback_buffer = dil["fallbackMarkdown"]
 
         slug = str(metadata.get("model_slug") or "").strip()
         if slug and self.active_role == "assistant":
@@ -315,7 +499,7 @@ class WebTextStreamTracker:
         ):
             self.last_patch_path = "/message/content/parts/0"
             msg_text = _assistant_message_text(msg)
-            if msg_text and self._is_active_visible():
+            if msg_text:
                 self.current_msg_raw = msg_text
         else:
             self.last_patch_path = ""
@@ -349,8 +533,10 @@ class WebTextStreamTracker:
             if slug and self.active_role == "assistant":
                 self.model_slug = slug
             dil = op_v.get("model_dil_v2")
-            if isinstance(dil, dict) and isinstance(dil.get("fallbackMarkdown"), str):
-                self._set_dil_fallback(dil["fallbackMarkdown"])
+            if isinstance(dil, dict):
+                self.active_has_dil = True
+                if isinstance(dil.get("fallbackMarkdown"), str):
+                    self._set_dil_fallback(dil["fallbackMarkdown"])
 
     def _handle_patch_op(self, op: dict[str, Any], *, apply_visibility: bool = True) -> None:
         op_p = op.get("p")
@@ -378,7 +564,9 @@ class WebTextStreamTracker:
         if isinstance(op_p, str) and op_p:
             if op_p == "/message/content/parts/0":
                 self.last_patch_path = "/message/content/parts/0"
-                if self._is_active_visible() and isinstance(op_v, (str, int, float)):
+                # Recorded even while hidden: a provisional message may become
+                # visible later; _current_candidates gates the output.
+                if not self.active_is_input_echo and isinstance(op_v, (str, int, float)):
                     self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
                 return
             if op_p.startswith("/message/metadata/model_dil_v2"):
@@ -387,6 +575,12 @@ class WebTextStreamTracker:
                 self.last_patch_path = op_p
                 self._apply_dil_op(op_p, op_o, op_v)
                 return
+            if op_p == "/message/end_turn" and op_v is True:
+                # The answer is final here; the upstream keeps the socket
+                # open for ~1s of telemetry, which callers should not wait on.
+                if self._is_active_visible() and self.current_msg_raw:
+                    self.turn_complete = True
+                return
             if _is_hidden_text_path(op_p):
                 self.last_patch_path = op_p
             return
@@ -394,39 +588,19 @@ class WebTextStreamTracker:
         if op_p in (None, "") and op_o in ("append", "replace") and isinstance(op_v, str):
             if self.last_patch_path == "/message/metadata/model_dil_v2/fallbackMarkdown":
                 self._apply_dil_op(self.last_patch_path, op_o, op_v)
-            elif self._is_active_visible() and self.last_patch_path == "/message/content/parts/0":
+            elif not self.active_is_input_echo and self.last_patch_path == "/message/content/parts/0":
                 self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
 
     def _set_dil_fallback(self, text: str) -> None:
-        """Record a fallbackMarkdown value and adopt it when it is safe.
-
-        ChatGPT also patches model_dil_v2 onto plain-text responses *after*
-        the message was created (observed on gpt-6-luna). Adopting a fallback
-        that disagrees with what was already emitted stalls the delta prefix
-        and truncates the answer, so a late fallback is only taken once it
-        covers everything already emitted. The buffer keeps accumulating even
-        while the fallback is not selected, so a value delivered in several
-        chunks can still be adopted when the complete text arrives. A fallback
-        declared at message creation is authoritative.
-        """
+        # Any model_dil_v2 metadata marks the message as DIL, even when it is
+        # patched in after creation (gpt-6-luna does this in the same patch
+        # list as the first parts/0 append). The fallback is only recorded;
+        # _pick_current decides at the end whether it may complete the answer.
+        self.active_has_dil = True
         self.dil_fallback_buffer = str(text or "")
-        if self.active_has_dil:
-            self.active_dil_fallback = self.dil_fallback_buffer
-            return
-        # Compare complete output candidates: fallbackMarkdown belongs to the
-        # current message, whereas emitted_text includes completed messages.
-        candidate = _sanitize_output_text("\n\n".join(
-            s for s in [*self.completed_segments, self.dil_fallback_buffer] if s
-        ))
-        if not self.input_message_ids and self.assistant_history_messages:
-            candidate = strip_history_prefix(
-                candidate, self.assistant_history_messages, hold_partial_prefix=True,
-            )
-        if not self.emitted_text or candidate.startswith(self.emitted_text):
-            self.active_has_dil = True
-            self.active_dil_fallback = self.dil_fallback_buffer
 
     def _apply_dil_op(self, path: str, op: Any, value: Any) -> None:
+        self.active_has_dil = True
         if path.endswith("/fallbackMarkdown"):
             if op == "replace":
                 self._set_dil_fallback(value)
@@ -506,15 +680,6 @@ class WebTextStreamTracker:
         return self._next_delta(hold_partial_prefix=True)
 
     def finalize_delta(self) -> str:
-        if self.active_has_dil and self.current_msg_raw:
-            stripped = _dil_to_text(self.current_msg_raw)
-            if not self.active_dil_fallback:
-                # No fallbackMarkdown arrived (older upstream): degrade to text.
-                self.active_dil_fallback = stripped
-            elif stripped.startswith(self.active_dil_fallback) and len(stripped) > len(self.active_dil_fallback):
-                # The server stopped patching fallbackMarkdown early; the raw
-                # DIL still holds the rest of the answer.
-                self.active_dil_fallback = stripped
         return self._next_delta(hold_partial_prefix=False)
 
 
@@ -676,6 +841,8 @@ class OpenAIWebTextClient(OpenAIWebImageClient):
                 delta = tracker.feed_payload(payload)
                 if delta and on_delta is not None:
                     on_delta(delta, tracker.model_slug)
+                if tracker.turn_complete:
+                    break
         finally:
             try:
                 resp.close()

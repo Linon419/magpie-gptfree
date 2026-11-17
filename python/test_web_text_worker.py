@@ -247,10 +247,8 @@ class WebTextWorkerTests(unittest.TestCase):
             "o": "append",
             "v": "{@body const x = 1}\n<box padding={2}>Hello</box>",
         }))
-        tail = bare.finalize_delta()
-        self.assertIn("Hello", tail)
-        self.assertNotIn("<box", tail)
-        self.assertNotIn("{@body", tail)
+        bare.finalize_delta()
+        self.assertEqual(bare.emitted_text, "Hello")
 
 
     def test_tracker_dil_fallback_respects_visibility_filters(self) -> None:
@@ -398,15 +396,14 @@ class WebTextWorkerTests(unittest.TestCase):
             "p": "/message/metadata/model_dil_v2/fallbackMarkdown",
             "o": "append", "v": "Hello",
         })), "")
-        self.assertFalse(tracker.active_has_dil)
         self.assertEqual(tracker.dil_fallback_buffer, "Hello")
         self.assertEqual(tracker.feed_payload(json.dumps({
             "p": "/message/metadata/model_dil_v2/fallbackMarkdown",
             "o": "append", "v": " World",
         })), "")
-        self.assertTrue(tracker.active_has_dil)
         self.assertEqual(tracker.dil_fallback_buffer, "Hello World")
         self.assertEqual(tracker.finalize_delta(), "")
+        self.assertEqual(tracker.emitted_text, "Hello World")
 
     def test_tracker_completes_partial_fallback_from_raw_dil(self) -> None:
         # A DIL response whose fallbackMarkdown stops early must still return
@@ -524,6 +521,88 @@ class WebTextWorkerTests(unittest.TestCase):
                 output = [tracker.feed_payload(json.dumps(e)) for e in events]
                 output.append(tracker.finalize_delta())
                 self.assertEqual("".join(output), "(正确答案：第 3 项)")
+
+    def test_real_gpt6_luna_badge_stream_renders_parts_not_fallback(self) -> None:
+        # Shape captured from gpt-6-luna on 2026-11-17: a hidden provisional
+        # message, then one patch list that appends a <badge>, removes the
+        # hidden flag and attaches model_dil_v2 whose fallback is escaped and
+        # incomplete. The old tracker emitted "(Correct answer)" and stalled.
+        tracker = web_text_worker.WebTextStreamTracker()
+        out = [tracker.feed_payload(json.dumps({"v": {"message": {
+            "id": "a", "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": [""]},
+            "metadata": {"is_visually_hidden_from_conversation": True},
+            "recipient": "all", "channel": "final",
+        }}}))]
+        out.append(tracker.feed_payload(json.dumps({"o": "patch", "v": [
+            {"p": "/message/content/parts/0", "o": "append",
+             "v": "<badge color=\"success\">Correct answer</badge>\n\n**"},
+            {"p": "/message/metadata/is_visually_hidden_from_conversation", "o": "remove"},
+            {"p": "/message/metadata", "o": "append", "v": {"model_dil_v2": {
+                "code": "DIL.render()", "fallbackMarkdown": "(Correct answer)\n\n**"}}},
+        ]})))
+        out.append(tracker.feed_payload(json.dumps({"v": [
+            {"p": "/message/content/parts/0", "o": "append",
+             "v": "Option C: What address did the database contain?**\n\n**Why:** stored time."},
+            {"p": "/message/metadata/model_dil_v2/code", "o": "replace", "v": "DIL.render(x)"},
+            {"p": "/message/metadata/model_dil_v2/fallbackMarkdown", "o": "append",
+             "v": "\\: stored time\\."},
+        ]})))
+        out.append(tracker.finalize_delta())
+        self.assertEqual("".join(out),
+            "Correct answer\n\n**Option C: What address did the database contain?**\n\n**Why:** stored time.")
+        self.assertGreaterEqual(sum(1 for c in out if c), 2, "answer must stream, not arrive at the end")
+
+    def test_dil_tags_split_across_chunks_never_leak(self) -> None:
+        source = ("Intro\n\n<box border radius=\"lg\" padding={3}>\n"
+                  "  <text color=\"secondary\" size=\"sm\">成本、销量</text>\n"
+                  "  <button onClick={()=>GenUI.issueNewTurn(\"a>b\")}>Go</button>\n"
+                  "</box>\n\nDone")
+        tracker = web_text_worker.WebTextStreamTracker()
+        tracker.feed_payload(json.dumps({"v": {"message": {
+            "id": "m", "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": [""]},
+            "metadata": {"model_dil_v2": {}},
+        }}}))
+        out = []
+        for i in range(0, len(source), 3):
+            d = tracker.feed_payload(json.dumps(
+                {"p": "/message/content/parts/0", "o": "append", "v": source[i:i + 3]}))
+            self.assertNotIn("<", d)
+            self.assertNotIn("=>", d)
+            out.append(d)
+        out.append(tracker.finalize_delta())
+        self.assertEqual("".join(out), "Intro\n\n成本、销量\nGo\n\nDone")
+
+    def test_dil_rendering_keeps_code_blocks_and_drops_appblocks(self) -> None:
+        source = ("Use:\n\n```html\n<div class=\"x\">{a}</div>\n```\n\n"
+                  "<AppBlock title=\"Drum\">\n<div>app</div>\n<script>if(a<b){}</script>\n</AppBlock>\n\nEnd")
+        self.assertEqual(web_text_worker._dil_to_text(source),
+                         "Use:\n\n```html\n<div class=\"x\">{a}</div>\n```\n\nEnd")
+        # Streaming prefixes stay prefixes of the final rendering.
+        final = web_text_worker._dil_to_text(source)
+        for i in range(len(source) + 1):
+            self.assertTrue(final.startswith(web_text_worker._dil_to_text(source[:i], final=False)), i)
+
+    def test_visible_end_turn_completes_the_turn(self) -> None:
+        tracker = web_text_worker.WebTextStreamTracker()
+        tracker.feed_payload(json.dumps({"v": {"message": {
+            "id": "sys", "author": {"role": "system"}, "end_turn": True,
+            "content": {"content_type": "text", "parts": [""]},
+        }}}))
+        self.assertFalse(tracker.turn_complete)
+        tracker.feed_payload(json.dumps({"v": {"message": {
+            "id": "a", "author": {"role": "assistant"},
+            "content": {"content_type": "text", "parts": [""]},
+        }}}))
+        tracker.feed_payload(json.dumps({"p": "/message/content/parts/0", "o": "append", "v": "Done"}))
+        self.assertFalse(tracker.turn_complete)
+        tracker.feed_payload(json.dumps({"v": [
+            {"p": "/message/status", "o": "replace", "v": "finished_successfully"},
+            {"p": "/message/end_turn", "o": "replace", "v": True},
+        ]}))
+        self.assertTrue(tracker.turn_complete)
+        self.assertEqual(tracker.emitted_text, "Done")
 
     def test_end_to_end_stream_with_prepare_conduit_and_effort_fallback(self) -> None:
         conv_calls: list[dict] = []
