@@ -199,6 +199,7 @@ class WebTextStreamTracker:
     last_patch_path: str = "/message/content/parts/0"
     emitted_text: str = ""
     active_dil_fallback: str = ""
+    dil_fallback_buffer: str = ""
     active_has_dil: bool = False
     blocked: bool = False
     model_slug: str = ""
@@ -291,6 +292,7 @@ class WebTextStreamTracker:
         if isinstance(dil, dict):
             self.active_has_dil = True
             self.active_dil_fallback = str(dil.get("fallbackMarkdown") or "")
+            self.dil_fallback_buffer = self.active_dil_fallback
         elif is_new_message:
             # A re-sent message without model_dil_v2 must not clear an active
             # fallback; only a genuinely new message starts a new text source.
@@ -342,7 +344,7 @@ class WebTextStreamTracker:
                 self.model_slug = slug
             dil = op_v.get("model_dil_v2")
             if isinstance(dil, dict) and isinstance(dil.get("fallbackMarkdown"), str):
-                self._adopt_dil_fallback(dil["fallbackMarkdown"])
+                self._set_dil_fallback(dil["fallbackMarkdown"])
 
     def _handle_patch_op(self, op: dict[str, Any], *, apply_visibility: bool = True) -> None:
         op_p = op.get("p")
@@ -379,36 +381,36 @@ class WebTextStreamTracker:
             if self._is_active_visible() and self.last_patch_path == "/message/content/parts/0":
                 self.current_msg_raw = _apply_patch_op(op, self.current_msg_raw)
 
-    def _adopt_dil_fallback(self, candidate: str) -> None:
-        """Adopt a fallbackMarkdown value, including late metadata.
+    def _set_dil_fallback(self, text: str) -> None:
+        """Record a fallbackMarkdown value and adopt it when it is safe.
 
         ChatGPT also patches model_dil_v2 onto plain-text responses *after*
         the message was created (observed on gpt-6-luna). Adopting a fallback
         that disagrees with what was already emitted stalls the delta prefix
-        and truncates the answer, so a late fallback is only taken when it
-        continues the emitted text (or lags behind it). A fallback declared at
-        message creation is authoritative.
+        and truncates the answer, so a late fallback is only taken once it
+        covers everything already emitted. The buffer keeps accumulating even
+        while the fallback is not selected, so a value delivered in several
+        chunks can still be adopted when the complete text arrives. A fallback
+        declared at message creation is authoritative.
         """
-        text = str(candidate or "")
+        self.dil_fallback_buffer = str(text or "")
         if self.active_has_dil:
-            self.active_dil_fallback = text
+            self.active_dil_fallback = self.dil_fallback_buffer
             return
         emitted = self.emitted_text
-        if emitted and not (text.startswith(emitted) or emitted.startswith(text)):
-            return
-        self.active_has_dil = True
-        self.active_dil_fallback = text
+        if not emitted or self.dil_fallback_buffer.startswith(emitted):
+            self.active_has_dil = True
+            self.active_dil_fallback = self.dil_fallback_buffer
 
     def _apply_dil_op(self, path: str, op: Any, value: Any) -> None:
         if path.endswith("/fallbackMarkdown"):
             if op == "replace":
-                self._adopt_dil_fallback(value)
+                self._set_dil_fallback(value)
             elif op == "append":
-                current = self.active_dil_fallback if self.active_has_dil else ""
-                self._adopt_dil_fallback(current + str(value or ""))
+                self._set_dil_fallback(self.dil_fallback_buffer + str(value or ""))
         elif path == "/message/metadata/model_dil_v2" and isinstance(value, dict):
             if isinstance(value.get("fallbackMarkdown"), str):
-                self._adopt_dil_fallback(value["fallbackMarkdown"])
+                self._set_dil_fallback(value["fallbackMarkdown"])
 
     def _handle_patch_list(self, items: list[Any]) -> None:
         dict_items = [item for item in items if isinstance(item, dict)]

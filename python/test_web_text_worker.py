@@ -378,6 +378,36 @@ class WebTextWorkerTests(unittest.TestCase):
             emitted.append(tail)
         self.assertEqual("".join(emitted), "(正确答案：第一项)")
 
+
+    def test_tracker_accumulates_late_fallback_fragments_until_they_cover_emitted(self) -> None:
+        # Late fallback arrives in chunks that are individually shorter than
+        # the emitted text. The buffer must keep them, so the complete value
+        # can still be adopted once it covers everything already sent.
+        tracker = web_text_worker.WebTextStreamTracker()
+        tracker.feed_payload(json.dumps({
+            "v": {"message": {
+                "id": "chunks-1",
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [""]},
+            }}
+        }))
+        self.assertEqual(tracker.feed_payload(json.dumps({
+            "p": "/message/content/parts/0", "o": "append", "v": "Hello World",
+        })), "Hello World")
+        self.assertEqual(tracker.feed_payload(json.dumps({
+            "p": "/message/metadata/model_dil_v2/fallbackMarkdown",
+            "o": "append", "v": "Hello",
+        })), "")
+        self.assertFalse(tracker.active_has_dil)
+        self.assertEqual(tracker.dil_fallback_buffer, "Hello")
+        self.assertEqual(tracker.feed_payload(json.dumps({
+            "p": "/message/metadata/model_dil_v2/fallbackMarkdown",
+            "o": "append", "v": " World",
+        })), "")
+        self.assertTrue(tracker.active_has_dil)
+        self.assertEqual(tracker.dil_fallback_buffer, "Hello World")
+        self.assertEqual(tracker.finalize_delta(), "")
+
     def test_tracker_completes_partial_fallback_from_raw_dil(self) -> None:
         # A DIL response whose fallbackMarkdown stops early must still return
         # the rest of the answer from the raw DIL instead of truncating.
