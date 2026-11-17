@@ -614,6 +614,10 @@ class WebTextWorkerTests(unittest.TestCase):
             "Unclosed `code<x": "Unclosed `code<x",
             "Set {#value": "Set {#value",
             "<badge>Correct answer</badge> x<y": "Correct answer x<y",
+            "Hello<badge>world</badge>": "Helloworld",
+            "答案<badge color=\"success\">正确</badge>": "答案正确",
+            "x<text and y": "x<text and y",
+            "a<b>c and List<String>": "a<b>c and List<String>",
         }
         for source, expected in cases.items():
             with self.subTest(source=source):
@@ -634,6 +638,28 @@ class WebTextWorkerTests(unittest.TestCase):
             tracker.feed_payload(json.dumps({"p": "/message/content/parts/0", "o": "append", "v": chunk}))
         tracker.finalize_delta()
         self.assertEqual(tracker.emitted_text, "Answer\n\nCompare x<y and `a<b>`")
+
+    def test_incremental_dil_rendering_matches_full_rendering(self) -> None:
+        import random
+        samples = [
+            "{@body const [n,setN] = DIL.useState(3)}\n<box border padding={3}>\n  <text>Hi x<y</text>\n</box>\n\n```js\nif (a<b) {}\n```\n\nDone",
+            "Hello<badge>world</badge> and `List<String>` then {#if ok}yes{/if}\n  ~~~\n<raw>\n  ~~~\nEnd",
+            "<AppBlock title=\"x\">\n<script>a<b</script>\n</AppBlock>\n\nAfter <button onClick={()=>GenUI.copy(\"a>b\")}>Copy</button>",
+        ]
+        rng = random.Random(7)
+        for source in samples:
+            for _ in range(20):
+                renderer = web_text_worker._DilRenderer()
+                pos = 0
+                while pos < len(source):
+                    pos = min(len(source), pos + rng.randint(1, 9))
+                    self.assertEqual(renderer.render(source[:pos], final=False),
+                                     web_text_worker._dil_to_text(source[:pos], final=False))
+                self.assertEqual(renderer.render(source, final=True), web_text_worker._dil_to_text(source))
+        # A replaced (not appended) parts/0 restarts cleanly.
+        renderer = web_text_worker._DilRenderer()
+        renderer.render("<box>old text</box>", final=False)
+        self.assertEqual(renderer.render("<box>new</box>", final=True), "new")
 
     def test_end_to_end_stream_with_prepare_conduit_and_effort_fallback(self) -> None:
         conv_calls: list[dict] = []

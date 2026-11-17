@@ -159,6 +159,18 @@ def _is_hidden_text_path(path: str) -> bool:
 
 _DIL_TAG_NAME = re.compile(r"[A-Za-z][\w.-]*")
 _MAX_DIL_TAG = 4000
+# Components seen in GPT-6 Intelligent UI output and its documented catalog.
+# Only these may open right after a word ("Hello<badge>..."); anything else
+# glued to a word ("x<y", "a<b>") is ordinary text.
+_KNOWN_DIL_TAGS = frozenset({
+    "appblock", "asyncimage", "asyncimagegroup", "avatar", "badge", "bold",
+    "box", "button", "callout", "caption", "card", "chart", "checkbox", "chip",
+    "cite", "code", "col", "column", "divider", "entity", "form", "grid",
+    "heading", "icon", "image", "input", "italic", "label", "link", "list",
+    "listitem", "map", "metric", "progress", "radio", "row", "select",
+    "slider", "spacer", "stack", "stat", "tab", "table", "tabs", "tag",
+    "text", "textarea", "title", "toggle", "tooltip",
+})
 
 
 def _scan_dil_tag(s: str, i: int) -> Any:
@@ -174,8 +186,7 @@ def _scan_dil_tag(s: str, i: int) -> Any:
     # are text; closing tags do follow text ("answer</badge>").
     if i + 1 >= n:
         return None
-    if i > 0 and s[i + 1] != "/" and (s[i - 1].isalnum() or s[i - 1] in ")]_"):
-        return -1
+    after_word = i > 0 and s[i + 1] != "/" and (s[i - 1].isalnum() or s[i - 1] in ")]_")
     j = i + 1
     closing = j < n and s[j] == "/"
     if closing:
@@ -188,7 +199,13 @@ def _scan_dil_tag(s: str, i: int) -> Any:
     name = m.group(0)
     j = m.end()
     if j >= n:
+        # "Hello<bad" may still become "Hello<badge>": hold only while the
+        # name can grow into a known component.
+        if after_word and not any(t.startswith(name.lower()) for t in _KNOWN_DIL_TAGS):
+            return -1
         return None
+    if after_word and name.lower() not in _KNOWN_DIL_TAGS:
+        return -1
     if s[j] not in " \t\r\n/>":
         return -1
     depth = 0
@@ -217,20 +234,36 @@ def _scan_dil_tag(s: str, i: int) -> Any:
     return None
 
 
-def _dil_to_text(text: str, *, final: bool = True) -> str:
-    """Render DIL (Markdown + component tags + {@body} JS) as plain Markdown.
+_LINE_START_MARKERS = ("```", "~~~", "{@body")
 
-    Runs on every streamed prefix: with final=False an unfinished tag,
-    control block, fence line or trailing whitespace is held back instead of
-    being emitted, so each result is a prefix of the next one. Fenced code
-    is copied verbatim; AppBlock apps are dropped whole.
+
+class _DilScan:
+    """Resumable scan state: everything before `i` is rendered into `out`.
+
+    Decisions about consumed text never depend on text that arrives later;
+    anything still ambiguous stops the scan at `i`, so streaming can resume
+    from the same position instead of re-rendering the whole message.
     """
-    s = str(text or "")
+
+    __slots__ = ("i", "out", "in_code", "line_start")
+
+    def __init__(self) -> None:
+        self.i = 0
+        self.out: list[str] = []
+        self.in_code = False
+        self.line_start = True
+
+    def copy(self) -> "_DilScan":
+        other = _DilScan()
+        other.i, other.out = self.i, self.out[:]
+        other.in_code, other.line_start = self.in_code, self.line_start
+        return other
+
+
+def _dil_scan(s: str, st: _DilScan, *, final: bool) -> None:
     n = len(s)
-    out: list[str] = []
-    i = 0
-    in_code = False
-    line_start = True
+    out = st.out
+    i, in_code, line_start = st.i, st.in_code, st.line_start
 
     def trim_indent_after_tag() -> None:
         # "  <box>" lines would otherwise leave indentation that Markdown
@@ -246,6 +279,10 @@ def _dil_to_text(text: str, *, final: bool = True) -> str:
             j = i
             while j < n and s[j] in " \t":
                 j += 1
+            # A fence or {@body line cannot be recognised until the line has
+            # enough characters; wait instead of consuming them as text.
+            if not final and any(m.startswith(s[j:]) for m in _LINE_START_MARKERS):
+                break
             if s.startswith("```", j) or s.startswith("~~~", j):
                 end = s.find("\n", j)
                 if end < 0:
@@ -258,9 +295,11 @@ def _dil_to_text(text: str, *, final: bool = True) -> str:
                 out.append(s[i:end + 1])
                 i = end + 1
                 continue
-            if not in_code and (s.startswith("{@body", j) or (j < n and not final and "{@body".startswith(s[j:]))):
+            if not in_code and s.startswith("{@body", j):
                 end = s.find("\n", j)
                 if end < 0:
+                    if not final:
+                        break
                     i = n
                     break
                 i = end + 1
@@ -289,18 +328,13 @@ def _dil_to_text(text: str, *, final: bool = True) -> str:
             line_start = False
             continue
         if c == "{" and (i + 1 >= n or s[i + 1] in "#:/"):
-            if i + 1 >= n:
-                if not final:
-                    break
-                out.append(c)
-                i += 1
-                continue
-            end = s.find("}", i)
+            end = s.find("}", i) if i + 1 < n else -1
             if end < 0:
                 if not final:
                     break
                 out.append(c)
                 i += 1
+                line_start = False
                 continue
             i = end + 1
             line_start = False
@@ -328,11 +362,52 @@ def _dil_to_text(text: str, *, final: bool = True) -> str:
         line_start = c == "\n"
         i += 1
 
+    st.i, st.in_code, st.line_start = i, in_code, line_start
+
+
+def _dil_finish(out: list[str], *, final: bool) -> str:
     result = "".join(out)
     result = re.sub(r"\n[ \t]+(?=\n)", "\n", result)
     result = re.sub(r"\n{3,}", "\n\n", result)
     result = result.lstrip()
     return result.rstrip() if final else result.rstrip(" \t\r\n")
+
+
+class _DilRenderer:
+    """Incremental _dil_to_text for an append-only stream."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.state = _DilScan()
+        self.consumed = ""
+
+    def render(self, text: str, *, final: bool) -> str:
+        s = str(text or "")
+        if not s.startswith(self.consumed):
+            # parts/0 was replaced rather than appended: start over.
+            self.reset()
+        if final:
+            st = self.state.copy()
+            _dil_scan(s, st, final=True)
+            return _dil_finish(st.out, final=True)
+        _dil_scan(s, self.state, final=False)
+        self.consumed = s[:self.state.i]
+        return _dil_finish(self.state.out, final=False)
+
+
+def _dil_to_text(text: str, *, final: bool = True) -> str:
+    """Render DIL (Markdown + component tags + {@body} JS) as plain Markdown.
+
+    With final=False an unfinished tag, control block, fence line or
+    trailing whitespace is held back instead of being emitted, so each
+    result is a prefix of the next one. Fenced code and inline code are
+    copied verbatim; AppBlock apps are dropped whole.
+    """
+    st = _DilScan()
+    _dil_scan(str(text or ""), st, final=final)
+    return _dil_finish(st.out, final=final)
 
 
 def _unescape_fallback(text: str) -> str:
@@ -375,6 +450,7 @@ class WebTextStreamTracker:
     active_has_dil: bool = False
     pending_delta: str = ""
     turn_complete: bool = False
+    dil_renderer: _DilRenderer = field(default_factory=_DilRenderer, repr=False, compare=False)
     blocked: bool = False
     model_slug: str = ""
 
@@ -412,7 +488,7 @@ class WebTextStreamTracker:
         raw = self.current_msg_raw
         if not self.active_has_dil:
             return [(raw, True)]
-        candidates = [(_dil_to_text(raw, final=final), True)]
+        candidates = [(self.dil_renderer.render(raw, final=final), True)]
         if final and self.dil_fallback_buffer:
             candidates.append((_unescape_fallback(self.dil_fallback_buffer), True))
         candidates.append((raw, False))
@@ -442,6 +518,8 @@ class WebTextStreamTracker:
             clean = self._clean(text, hold_partial_prefix=not final)
             if clean.startswith(self.emitted_text):
                 consistent.append((text, clean, rendered))
+                if not final:
+                    break
         if not consistent:
             return "", self.emitted_text
         if final:
@@ -499,6 +577,7 @@ class WebTextStreamTracker:
             self.current_msg_raw = ""
             self.active_has_dil = False
             self.dil_fallback_buffer = ""
+            self.dil_renderer.reset()
 
         self.active_is_input_echo = False
         self.active_role = role
