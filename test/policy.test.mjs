@@ -12,7 +12,7 @@ import {
   writeSettings,
 } from "../lib/pool-settings.mjs";
 import { runQuotaSweep, startQuotaSweep } from "../lib/quota-sweep.mjs";
-import { createInMemoryStatsStore } from "../lib/pool-stats.mjs";
+import { createInMemoryStatsStore, recordQuotaCheck } from "../lib/pool-stats.mjs";
 import { accountSlotTag } from "../lib/pool-connection.mjs";
 import { rotateAccountsForTest } from "../lib/codex-pool.mjs";
 import { createGuiService } from "../lib/gui-service.mjs";
@@ -365,6 +365,103 @@ test("GUI sweep endpoint runs one pass over the pool", async () => {
     await harness.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("roundRobin rotates starting accounts even when a preferredSlot is pinned", () => {
+  const accounts = [
+    { email: "one@example.com" },
+    { email: "two@example.com" },
+    { email: "three@example.com" },
+  ];
+  const preferredSlot = accountSlotTag("one@example.com");
+  const firsts = new Set();
+  for (let i = 0; i < 3; i++) {
+    const ordered = rotateAccountsForTest(accounts, null, {
+      strategy: "roundRobin",
+      skipRateLimited: true,
+      preferredSlot,
+      respectPreferredSlot: true,
+    });
+    firsts.add(ordered[0].email);
+  }
+  assert.equal(firsts.size, 3, "roundRobin must rotate past the pinned preferred slot");
+});
+
+test("quota sweep reads quotaCheckedAt from pool stats and allows staleAfterMinutes=0 to force check", async () => {
+  const statsStore = createInMemoryStatsStore();
+  await recordQuotaCheck(
+    { email: "fresh@example.com", quota: 8, rateLimited: false },
+    { statsStore },
+  );
+  const rows = [{ email: "fresh@example.com" }, { email: "unchecked@example.com" }];
+
+  const skippedRun = [];
+  const summary1 = await runQuotaSweep({
+    poolRead: async () => rows,
+    staleAfterMinutes: 120,
+    statsTarget: { statsStore },
+    probe: async (row) => {
+      skippedRun.push(row.email);
+      return { ok: true, imageQuota: 5, rateLimited: false };
+    },
+    record: async () => {},
+  });
+  assert.deepEqual(skippedRun, ["unchecked@example.com"]);
+  assert.equal(summary1.skipped, 1);
+  assert.equal(summary1.checked, 1);
+
+  const forcedRun = [];
+  const summary2 = await runQuotaSweep({
+    poolRead: async () => rows,
+    staleAfterMinutes: 0,
+    statsTarget: { statsStore },
+    probe: async (row) => {
+      forcedRun.push(row.email);
+      return { ok: true, imageQuota: 5, rateLimited: false };
+    },
+    record: async () => {},
+  });
+  assert.deepEqual(forcedRun.sort(), ["fresh@example.com", "unchecked@example.com"]);
+  assert.equal(summary2.skipped, 0);
+  assert.equal(summary2.checked, 2);
+});
+
+test("startQuotaSweep runNow tracks running state, clears previous timer, and honours stop()", async () => {
+  let cleared = 0;
+  let releaseProbe;
+  const controller = startQuotaSweep({
+    readSettings: async () => ({
+      rotation: {},
+      sweep: { enabled: true, intervalMinutes: 30, staleAfterMinutes: 60, pauseDuringImport: true },
+    }),
+    poolRead: async () => [{ email: "a@example.com" }, { email: "b@example.com" }],
+    probe: async (_row, { signal }) => {
+      await new Promise((resolve) => {
+        releaseProbe = resolve;
+        signal?.addEventListener("abort", resolve, { once: true });
+      });
+      return { ok: true, imageQuota: 4, rateLimited: false };
+    },
+    record: async () => {},
+    setTimer: (_fn, _ms) => ({ id: Math.random(), unref() {} }),
+    clearTimer: () => { cleared++; },
+    initialDelayMs: 60_000,
+  });
+
+  const runPromise = controller.runNow();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.isRunning(), true);
+
+  // Overlapping runNow is rejected cleanly without double-running.
+  const overlapping = await controller.runNow();
+  assert.equal(overlapping.aborted, true);
+
+  // stop() aborts the in-flight manual sweep cleanly.
+  controller.stop();
+  const result = await runPromise;
+  assert.equal(controller.isRunning(), false);
+  assert.equal(result.aborted, true);
+  assert.ok(cleared >= 1);
 });
 
 // --- helpers -------------------------------------------------------------
