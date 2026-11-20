@@ -6,7 +6,7 @@
 import { CODEX_BASE, discoverPoolModels, poolFetch } from "./lib/codex-pool.mjs";
 import { GUI_PORT, startGuiServer } from "./lib/gui-service.mjs";
 import { createPoolConnector, POOL_MARKER, POOL_PROVIDER } from "./lib/pool-connection.mjs";
-import { nativeImportMethod } from "./lib/provider-native-signin.mjs";
+import { nativeImportMethod, webOAuthMethod } from "./lib/provider-native-signin.mjs";
 
 let sharedClient = null;
 let sharedConnector = null;
@@ -89,15 +89,22 @@ export const GPTFreePoolPlugin = async (ctx = {}) => {
     auth: {
       provider: POOL_PROVIDER,
       maxConcurrency: 2,
-      // Native Magpie prompt & file chooser; never opens an external website.
       // Multi-account management stays enabled so every pooled account gets its
-      // own toggleable row in Magpie Providers.
-      methods: [nativeImportMethod({
-        ...(connector ? { server: () => startGuiServer({ port: GUI_PORT, onPoolChange: () => sharedConnector?.sync() }) } : {}),
-        syncPool: () => sharedConnector?.sync(),
-        claimSlotKey: (slot, key) => sharedConnector?.claimKey(slot, key),
-        activeKey: () => (sharedActiveKey ? sharedActiveKey() : ""),
-      })],
+      // own toggleable row in Magpie Providers. Supports both browser OAuth
+      // sign-in (open or copy link) and native TXT batch file import.
+      methods: [
+        webOAuthMethod({
+          syncPool: () => sharedConnector?.sync(),
+          claimSlotKey: (slot, key) => sharedConnector?.claimKey(slot, key),
+          activeKey: () => (sharedActiveKey ? sharedActiveKey() : ""),
+        }),
+        nativeImportMethod({
+          ...(connector ? { server: () => startGuiServer({ port: GUI_PORT, onPoolChange: () => sharedConnector?.sync() }) } : {}),
+          syncPool: () => sharedConnector?.sync(),
+          claimSlotKey: (slot, key) => sharedConnector?.claimKey(slot, key),
+          activeKey: () => (sharedActiveKey ? sharedActiveKey() : ""),
+        }),
+      ],
       async loader(getAuth) {
         const auth = await getAuth();
         if (auth?.type !== "api") return {};
