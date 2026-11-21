@@ -26,6 +26,7 @@ from image_worker import (
     ImageWorkerError,
     OpenAIWebImageClient,
     UpstreamHTTPError,
+    WorkerSessionPool,
     _apply_patch_op,
     _assistant_message_text,
     _is_token_invalid_text,
@@ -1134,7 +1135,88 @@ def handle_text_payload(
         return _error_response_dict(exc)
 
 
+def run_text_daemon_loop(session_pool: Optional[WorkerSessionPool] = None) -> None:
+    pool = session_pool or WorkerSessionPool()
+    try:
+        while True:
+            raw_line = sys.stdin.buffer.readline(MAX_STDIN_BYTES + 1)
+            if not raw_line:
+                break
+            if len(raw_line) > MAX_STDIN_BYTES:
+                _emit_ndjson(
+                    {
+                        "id": "",
+                        "ok": False,
+                        "type": "error",
+                        "http_status": 413,
+                        "error_code": "payload_too_large",
+                        "error": "Input payload exceeds maximum size",
+                    }
+                )
+                continue
+            line_str = raw_line.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                continue
+            req_id = ""
+            try:
+                envelope = json.loads(line_str)
+                if isinstance(envelope, dict) and "payload" in envelope and isinstance(envelope.get("id"), str):
+                    req_id = envelope["id"]
+                    data = envelope["payload"]
+                else:
+                    data = envelope
+            except Exception as exc:
+                err = _error_response_dict(exc)
+                if req_id:
+                    err["id"] = req_id
+                _emit_ndjson(err)
+                continue
+
+            stream_events = True if not isinstance(data, dict) else (data.get("stream_events") is not False)
+            tok = str(data.get("access_token") or "").strip() if isinstance(data, dict) else ""
+            prx = str(data.get("proxy") or "").strip() if isinstance(data, dict) else ""
+            warm_session = pool.acquire(tok, prx) if tok else None
+
+            def emit_delta(delta: str, model_slug: str) -> None:
+                if stream_events and delta:
+                    ev: Dict[str, Any] = {"type": "delta", "delta": delta}
+                    if req_id:
+                        ev["id"] = req_id
+                    if model_slug:
+                        ev["model"] = model_slug
+                    _emit_ndjson(ev)
+
+            result = handle_text_payload(
+                data,
+                session=warm_session,
+                on_delta=emit_delta if stream_events else None,
+            )
+            if not result.get("ok") and (
+                int(result.get("http_status") or 0) in (401, 403) or result.get("token_invalid")
+            ):
+                pool.evict(tok, prx)
+
+            if result.get("ok"):
+                out: Dict[str, Any] = {
+                    **({"id": req_id} if req_id else {}),
+                    "ok": True,
+                    "type": "done",
+                    "text": result.get("text", ""),
+                    "conversation_id": result.get("conversation_id", ""),
+                    "model": result.get("model", ""),
+                }
+                _emit_ndjson(out)
+            else:
+                out_err = {**({"id": req_id} if req_id else {}), **result}
+                _emit_ndjson(out_err)
+    finally:
+        pool.close_all()
+
+
 def main() -> None:
+    if "--daemon" in sys.argv[1:]:
+        run_text_daemon_loop()
+        return
     stream_events = "--stream" in sys.argv[1:]
     try:
         raw = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)

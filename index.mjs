@@ -85,11 +85,23 @@ export const GPTFreeGuiPlugin = async (ctx, options) => {
   if (options?.autoRefresh !== false && !autoRefresh) {
     const settings = await readAutoRefreshSettings().catch(() => ({ enabled: true }));
     if (settings.enabled) {
+      let pendingRenewSync = null;
+      const coalescedSync = () => {
+        if (pendingRenewSync) return pendingRenewSync;
+        pendingRenewSync = new Promise((resolve) => {
+          const timer = setTimeout(resolve, 250);
+          timer.unref?.();
+        })
+          .then(() => connection.sync())
+          .catch(() => {})
+          .finally(() => { pendingRenewSync = null; });
+        return pendingRenewSync;
+      };
       autoRefresh = startAutoRefresh({
         intervalMs: (settings.intervalMinutes || 60) * 60 * 1000,
         leadMs: (settings.leadHours || 48) * 60 * 60 * 1000,
         getProxy: async () => (await readAutoRefreshSettings().catch(() => ({}))).proxy || "",
-        onRenewed: () => connection.sync(),
+        onRenewed: () => coalescedSync(),
         log: (level, message) => ctx?.client?.app?.log?.({
           body: { service: "gptfree", level, message },
         }),

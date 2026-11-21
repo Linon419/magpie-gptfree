@@ -303,19 +303,42 @@ def _is_quota_exhausted(error_msg: str) -> bool:
     return any(marker in low for marker in _QUOTA_EXHAUSTED_MARKERS)
 
 
+_RESET_AFTER_EN_RE = re.compile(
+    r"(?:resets?\s+in|after)\s+(\d+)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?)",
+    re.IGNORECASE,
+)
+_EN_RESET_UNIT_SECONDS = {
+    "day": 86400, "days": 86400,
+    "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+    "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+    "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+}
+
+
 def _parse_reset_after_seconds(error_msg: str) -> int | None:
-    """Turn "上限将在 23小时 后重置" into seconds so the pool can cool the slot."""
+    """Turn "上限将在 23小时 后重置" or "resets in 23 hours" into seconds."""
     if not error_msg:
         return None
-    match = _RESET_AFTER_RE.search(str(error_msg))
-    if not match:
-        return None
-    try:
-        amount = int(match.group(1))
-    except (TypeError, ValueError):
-        return None
-    seconds = amount * _RESET_UNIT_SECONDS.get(match.group(2), 0)
-    return seconds if seconds > 0 else None
+    text = str(error_msg)
+    match = _RESET_AFTER_RE.search(text)
+    if match:
+        try:
+            amount = int(match.group(1))
+            seconds = amount * _RESET_UNIT_SECONDS.get(match.group(2), 0)
+            if seconds > 0:
+                return seconds
+        except (TypeError, ValueError):
+            pass
+    en_match = _RESET_AFTER_EN_RE.search(text)
+    if en_match:
+        try:
+            amount = int(en_match.group(1))
+            seconds = amount * _EN_RESET_UNIT_SECONDS.get(en_match.group(2).lower(), 0)
+            if seconds > 0:
+                return seconds
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def _is_content_policy_error(error_msg: str) -> bool:
@@ -962,10 +985,10 @@ class OpenAIWebImageClient:
         if self.thinking_effort in {"none", "auto"}:
             self.thinking_effort = ""
         self.user_agent = DEFAULT_USER_AGENT
-        self.device_id = str(uuid.uuid4())
-        self.session_id = str(uuid.uuid4())
-        self.pow_script_sources: list[str] = []
-        self.pow_data_build = ""
+        self.device_id = str(getattr(session, "_gptfree_device_id", "") or uuid.uuid4())
+        self.session_id = str(getattr(session, "_gptfree_session_id", "") or uuid.uuid4())
+        self.pow_script_sources: list[str] = list(getattr(session, "_gptfree_pow_scripts", None) or [])
+        self.pow_data_build = str(getattr(session, "_gptfree_pow_build", "") or "")
         self.poll_timeout_secs = max(0.05, float(poll_timeout_secs))
         self.initial_wait_secs = max(0.0, float(initial_wait_secs))
         self.poll_interval_secs = max(0.05, float(poll_interval_secs))
@@ -1195,7 +1218,11 @@ class OpenAIWebImageClient:
             "checked_at": int(time.time()),
         }
 
-    def _bootstrap(self) -> None:
+    def _bootstrap(self, *, force: bool = False) -> None:
+        now_ts = time.time()
+        cached_at = float(getattr(self.session, "_gptfree_bootstrapped_at", 0.0) or 0.0)
+        if not force and cached_at > 0 and (now_ts - cached_at) < 600.0 and self.pow_script_sources:
+            return
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
@@ -1205,18 +1232,34 @@ class OpenAIWebImageClient:
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(getattr(response, "text", "") or "")
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+        if getattr(self.session, "_gptfree_pooled", False):
+            setattr(self.session, "_gptfree_bootstrapped_at", time.time())
+            setattr(self.session, "_gptfree_pow_scripts", list(self.pow_script_sources))
+            setattr(self.session, "_gptfree_pow_build", self.pow_data_build)
 
     def _get_chat_requirements(self) -> ChatRequirements:
         base = "/backend-api/sentinel/chat-requirements"
-        p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
-
         prepare_path = base + "/prepare"
-        response = self.session.post(
-            self.base_url + prepare_path,
-            headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
-            json={"p": p_token},
-            timeout=30,
-        )
+        p_token = ""
+        response = None
+        for attempt in range(2):
+            p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
+            response = self.session.post(
+                self.base_url + prepare_path,
+                headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
+                json={"p": p_token},
+                timeout=30,
+            )
+            if (
+                attempt == 0
+                and getattr(self.session, "_gptfree_pooled", False)
+                and int(getattr(response, "status_code", 0) or 0) in (401, 403)
+            ):
+                setattr(self.session, "_gptfree_bootstrapped_at", 0.0)
+                self._bootstrap(force=True)
+                continue
+            break
+        assert response is not None
         self._ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
 
@@ -2233,7 +2276,139 @@ def handle_payload(data: Any, *, session: Any = None) -> Dict[str, Any]:
         }
 
 
+class WorkerSessionPool:
+    """Bounded LRU cache of warm curl_cffi Sessions keyed by (token_hash, proxy)."""
+
+    def __init__(self, *, max_entries: int = 32, ttl_secs: float = 600.0) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self.ttl_secs = max(10.0, float(ttl_secs))
+        self._entries: Dict[str, tuple[Any, float]] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(access_token: str, proxy_url: str) -> str:
+        digest = hashlib.sha256(f"{access_token}|{proxy_url}".encode("utf-8")).hexdigest()
+        return digest[:24]
+
+    def acquire(self, access_token: str, proxy: str = "", *, session_factory: Any = None) -> Any:
+        if not access_token:
+            return None
+        resolved_proxy = resolve_proxy(proxy)
+        key = self._key(access_token, resolved_proxy)
+        now_ts = time.time()
+        with self._lock:
+            existing = self._entries.pop(key, None)
+            if existing is not None:
+                sess, created_at = existing
+                if (now_ts - created_at) < self.ttl_secs:
+                    self._entries[key] = (sess, created_at)
+                    return sess
+                self._close_quietly(sess)
+
+            if session_factory is not None:
+                sess = session_factory(resolved_proxy)
+            else:
+                if requests is None:
+                    return None
+                kwargs: Dict[str, Any] = {"impersonate": "chrome110", "verify": True}
+                if resolved_proxy:
+                    kwargs["proxy"] = resolved_proxy
+                sess = requests.Session(**kwargs)
+
+            setattr(sess, "_gptfree_pooled", True)
+            setattr(sess, "_gptfree_device_id", str(uuid.uuid4()))
+            setattr(sess, "_gptfree_session_id", str(uuid.uuid4()))
+            setattr(sess, "_gptfree_pow_scripts", [])
+            setattr(sess, "_gptfree_pow_build", "")
+            setattr(sess, "_gptfree_bootstrapped_at", 0.0)
+
+            while len(self._entries) >= self.max_entries:
+                oldest_key = next(iter(self._entries))
+                old_sess, _ = self._entries.pop(oldest_key)
+                self._close_quietly(old_sess)
+            self._entries[key] = (sess, now_ts)
+            return sess
+
+    def evict(self, access_token: str, proxy: str = "") -> None:
+        if not access_token:
+            return
+        resolved_proxy = resolve_proxy(proxy)
+        key = self._key(access_token, resolved_proxy)
+        with self._lock:
+            popped = self._entries.pop(key, None)
+        if popped is not None:
+            self._close_quietly(popped[0])
+
+    def close_all(self) -> None:
+        with self._lock:
+            items = list(self._entries.values())
+            self._entries.clear()
+        for sess, _ in items:
+            self._close_quietly(sess)
+
+    @staticmethod
+    def _close_quietly(sess: Any) -> None:
+        if hasattr(sess, "close"):
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+
+def run_daemon_loop(session_pool: Optional[WorkerSessionPool] = None) -> None:
+    pool = session_pool or WorkerSessionPool()
+    try:
+        while True:
+            raw_line = sys.stdin.buffer.readline(MAX_STDIN_BYTES + 1)
+            if not raw_line:
+                break
+            if len(raw_line) > MAX_STDIN_BYTES:
+                err_out = {
+                    "id": "",
+                    "ok": False,
+                    "http_status": 413,
+                    "error_code": "payload_too_large",
+                    "error": "Daemon request line exceeds maximum size",
+                }
+                sys.stdout.buffer.write((json.dumps(err_out, ensure_ascii=True) + "\n").encode("utf-8"))
+                sys.stdout.buffer.flush()
+                continue
+            line_str = raw_line.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                continue
+            req_id = ""
+            try:
+                envelope = json.loads(line_str)
+                if isinstance(envelope, dict) and "payload" in envelope and isinstance(envelope.get("id"), str):
+                    req_id = envelope["id"]
+                    data = envelope["payload"]
+                else:
+                    data = envelope
+                tok = str(data.get("access_token") or "").strip() if isinstance(data, dict) else ""
+                prx = str(data.get("proxy") or "").strip() if isinstance(data, dict) else ""
+                warm_session = pool.acquire(tok, prx) if tok else None
+                result = handle_payload(data, session=warm_session)
+                if not result.get("ok") and int(result.get("http_status") or 0) in (401, 403):
+                    pool.evict(tok, prx)
+                out = {"id": req_id, **result} if req_id else result
+            except Exception as exc:
+                out = {
+                    **({"id": req_id} if req_id else {}),
+                    "ok": False,
+                    "http_status": 500,
+                    "error_code": "image_worker_error",
+                    "error": _sanitize_error_text(str(exc)),
+                }
+            sys.stdout.buffer.write((json.dumps(out, ensure_ascii=True) + "\n").encode("utf-8"))
+            sys.stdout.buffer.flush()
+    finally:
+        pool.close_all()
+
+
 def main() -> None:
+    if "--daemon" in sys.argv[1:]:
+        run_daemon_loop()
+        return
     try:
         raw_bytes = sys.stdin.buffer.read(MAX_STDIN_BYTES)
         raw = raw_bytes.decode("utf-8") if raw_bytes else ""

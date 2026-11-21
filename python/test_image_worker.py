@@ -560,6 +560,48 @@ class ImageWorkerUnitTests(unittest.TestCase):
         self.assertEqual(res_429["http_status"], 429)
         self.assertEqual(res_429["retry_after"], 95)
 
+    def test_worker_session_pool_reuses_bootstrap_and_parses_english_reset_after(self):
+        self.assertEqual(image_worker._parse_reset_after_seconds("Limit reached. Resets in 5 hours."), 18000)
+        self.assertEqual(image_worker._parse_reset_after_seconds("Try again after 45 minutes"), 2700)
+
+        bootstrap_hits = 0
+
+        def pooled_handler(method, url, kwargs):
+            nonlocal bootstrap_hits
+            if method == "GET" and url == "https://chatgpt.com/":
+                bootstrap_hits += 1
+                return FakeResponse(text='<script src="https://cdn.oaistatic.com/assets/pow1.js"></script><html data-build="b123"></html>')
+            if method == "POST" and "prepare" in url:
+                return FakeResponse(json_data={"prepare_token": "pt", "conduit_token": "ct"})
+            if method == "POST" and "finalize" in url:
+                return FakeResponse(json_data={"token": "st"})
+            raise AssertionError(f"Unexpected call: {method} {url}")
+
+        pool = image_worker.WorkerSessionPool(max_entries=2, ttl_secs=600)
+        try:
+            s1 = pool.acquire("tok-warm", "", session_factory=lambda _p: FakeSession(pooled_handler))
+            with image_worker.OpenAIWebImageClient("tok-warm", session=s1) as c1:
+                c1._bootstrap()
+                req1 = c1._get_chat_requirements()
+                self.assertEqual(req1.token, "st")
+            self.assertEqual(bootstrap_hits, 1)
+
+            # Second acquire with same token hits cached warm session and skips GET / HTML bootstrap!
+            s2 = pool.acquire("tok-warm", "", session_factory=lambda _p: FakeSession(pooled_handler))
+            self.assertIs(s1, s2)
+            with image_worker.OpenAIWebImageClient("tok-warm", session=s2) as c2:
+                c2._bootstrap()
+                req2 = c2._get_chat_requirements()
+                self.assertEqual(req2.token, "st")
+            self.assertEqual(bootstrap_hits, 1)
+
+            # Eviction removes the cached session cleanly
+            pool.evict("tok-warm", "")
+            s3 = pool.acquire("tok-warm", "", session_factory=lambda _p: FakeSession(pooled_handler))
+            self.assertIsNot(s1, s3)
+        finally:
+            pool.close_all()
+
 
 if __name__ == "__main__":
     unittest.main()
