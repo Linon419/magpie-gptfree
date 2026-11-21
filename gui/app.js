@@ -34,6 +34,11 @@
     failed: "授权失败",
   };
   let preview = null, previewSource = "", lastSeq = 0, polling = null, busy = false, poolBusy = false, checkingDraft = false, activeTab = "import";
+  let lastPoolSnapshot = null, lastStatsSnapshot = null;
+  let poolFilter = "all", poolSearch = "", poolPage = 1;
+  let statsSearch = "", statsPage = 1;
+  const POOL_PAGE_SIZE = 40;
+  const STATS_PAGE_SIZE = 50;
   const jobStates = new Map();
   const rowMessages = new Map();
   // Magpie restarts its plugin host about once an hour (community plugin
@@ -392,12 +397,72 @@
   }
   function setPoolBusyState(next) {
     poolBusy = next;
-    const hasRows = !!$("poolList")?.querySelector(".account-row");
+    const totalCount = Number(lastPoolSnapshot?.total ?? 0);
+    const hasRows = totalCount > 0 || !!$("poolList")?.querySelector(".account-row");
     $("refreshAllPool").disabled = poolBusy || !hasRows;
+    if ($("refreshAbnormalPool")) $("refreshAbnormalPool").disabled = poolBusy || !hasRows;
+    if ($("pruneInvalidBtn")) $("pruneInvalidBtn").disabled = poolBusy || !hasRows;
+    if ($("pingPoolBtn")) $("pingPoolBtn").disabled = poolBusy || !hasRows;
+    if ($("headerPingBtn")) $("headerPingBtn").disabled = poolBusy;
     if ($("syncProviders")) $("syncProviders").disabled = poolBusy;
     if ($("exportCpa")) $("exportCpa").disabled = poolBusy;
     if ($("refreshStatsQuota")) $("refreshStatsQuota").disabled = poolBusy || !hasRows;
     if ($("reloadStats")) $("reloadStats").disabled = poolBusy;
+  }
+  function renderPingBanner(message, isError = false) {
+    const bar = $("pingBanner");
+    if (!bar) return;
+    bar.className = "ping-banner" + (isError ? " error" : "");
+    bar.replaceChildren(el("span", "", message));
+    const closeBtn = el("button", "btn secondary small", "收起");
+    closeBtn.type = "button";
+    closeBtn.addEventListener("click", () => bar.classList.add("hidden"));
+    bar.append(closeBtn);
+  }
+  async function runPingTest(targetId = "", labelHint = "") {
+    if (poolBusy || busy) return;
+    setPoolBusyState(true);
+    renderPingBanner(labelHint ? `⚡ 正在实测 ${labelHint} 的首字延迟…` : "⚡ 正在实测当前热缓存账号的首字响应延迟（TTFT）…", false);
+    try {
+      const proxy = ($("poolProxyInput")?.value || $("statsProxyInput")?.value || $("proxyInput")?.value || "").trim();
+      const res = await api("accounts/ping", { ...(targetId ? { id: targetId } : {}), proxy });
+      if (res.ok) {
+        const chName = res.channel === "codex" ? "Codex 原生通道" : "Web 常驻守护通道";
+        const msg = `⚡ 测速通过 [${chName} · ${res.model}]：首字延迟 TTFT ${res.ttftMs} ms · 总耗时 ${res.totalMs} ms · 回复 "${res.reply || "Pong"}"`;
+        renderPingBanner(msg, false);
+        notice(msg);
+        void loadPool();
+      } else {
+        const errMsg = `⚡ 测速失败 [${res.model || ""}]：${res.error || "连接异常"}（耗时 ${res.totalMs || 0} ms）`;
+        renderPingBanner(errMsg, true);
+        notice(errMsg, true);
+      }
+    } catch (err) {
+      renderPingBanner("⚡ 测速请求失败：" + err.message, true);
+      notice(err.message, true);
+    } finally {
+      setPoolBusyState(false);
+    }
+  }
+  async function pruneInvalidAccounts() {
+    if (poolBusy || busy) return;
+    const accounts = Array.isArray(lastPoolSnapshot?.accounts) ? lastPoolSnapshot.accounts : [];
+    const deadCount = accounts.filter((a) => a.tokenState === "missing" || a.tokenState === "invalid" || a.quotaStatus === "unavailable").length;
+    if (!deadCount) {
+      notice("当前号池没有无 Token 或损坏的死号（过期账号支持自动续期，无需清理）");
+      return;
+    }
+    if (!confirm(`确认从本地号池一键清理 ${deadCount} 个无可用 Token 的死号？`)) return;
+    setPoolBusyState(true);
+    try {
+      const res = await api("remove-batch", { mode: "invalid" });
+      await loadPool();
+      notice(`已清理 ${res.removed} 个失效账号，剩余 ${res.remaining} 个健康账号`);
+    } catch (err) {
+      notice("批量清理失败：" + err.message, true);
+    } finally {
+      setPoolBusyState(false);
+    }
   }
   async function exportCpaNow() {
     if (poolBusy || busy) return;
@@ -457,13 +522,17 @@
         await loadPool();
       }
       if (quotaOnly) {
-        if (res.failed > 0 && res.quotaChecked === 0) {
+        if (res.total === 0) {
+          notice("当前没有需要刷新额度的异常账号");
+        } else if (res.failed > 0 && res.quotaChecked === 0) {
           const detail = res.results?.[0]?.quotaError || res.results?.[0]?.reason || "请检查代理或账号状态";
           notice("额度检测失败：" + res.failed + " 个账号查询失败（" + detail + "）", true);
         } else {
           const totalQ = res.quotaStats?.totalQuota ?? 0;
           notice(`额度检测完成：已更新 ${res.quotaChecked ?? (res.valid + res.renewed)} 个账号 · 当前可用总剩余额度 ${totalQ}${res.failed ? ` · 失败 ${res.failed} 个` : ""}`);
         }
+      } else if (res.total === 0) {
+        notice("全部账号状态健康，无需重登或修复");
       } else if (res.failed > 0 && res.renewed === 0 && res.valid === 0) {
         notice("检测完成：" + res.failed + " 个账号刷新失败，请检查代理或账号状态", true);
       } else if (res.quotaFailed > 0) {
@@ -512,7 +581,126 @@
       checkingDraft = false;
     }
   }
+  function bestUsageMeterInfo(account, softCapPercent = 80) {
+    const candidates = [];
+    if (typeof account.codexUsedPercent === "number") {
+      candidates.push({ label: "Codex", pct: account.codexUsedPercent });
+    }
+    if (typeof account.imageUsedPercent === "number") {
+      candidates.push({ label: "生图", pct: account.imageUsedPercent });
+    }
+    if (typeof account.textUsedPercent === "number" && account.textUsedPercent > 0) {
+      candidates.push({ label: "对话窗口", pct: account.textUsedPercent });
+    }
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.pct - a.pct);
+    const top = candidates[0];
+    const level = top.pct >= 100 ? "bad" : (top.pct >= softCapPercent ? "warn" : "");
+    return {
+      label: `${top.label}已用 ${top.pct}%`,
+      pct: Math.max(0, Math.min(100, top.pct)),
+      level,
+    };
+  }
+  function createUsageMeterNode(account, softCapPercent = 80) {
+    const info = bestUsageMeterInfo(account, softCapPercent);
+    if (!info) return null;
+    const wrap = el("span", "usage-meter");
+    wrap.title = `单号消耗达 ${softCapPercent}% 后自动切换下一个健康账号保缓存`;
+    const bar = el("span", "usage-bar");
+    const fill = el("span", "usage-fill" + (info.level ? " " + info.level : ""));
+    fill.style.width = info.pct + "%";
+    bar.append(fill);
+    wrap.append(bar, el("span", "", info.label));
+    return wrap;
+  }
+  function matchesPoolFilter(account, filter, query) {
+    if (filter === "codex" && account.channel !== "codex") return false;
+    if (filter === "web" && account.channel !== "web") return false;
+    if (filter === "sticky" && !account.stickyActive) return false;
+    if (filter === "priority" && !account.priority) return false;
+    if (filter === "available" && account.quotaStatus !== "available") return false;
+    if (filter === "softcap" && !account.softCapped) return false;
+    if (filter === "abnormal") {
+      const isAbn = account.tokenState !== "unexpired_unverified" ||
+        account.quotaStatus === "limited" ||
+        account.quotaStatus === "error" ||
+        account.quotaStatus === "unavailable" ||
+        account.quotaStatus === "needs_renew" ||
+        Boolean(account.textCooldownUntil) ||
+        Boolean(account.codexRateLimited);
+      if (!isAbn) return false;
+    }
+    if (query) {
+      const q = query.toLowerCase();
+      const hay = `${account.slotLabel || ""} ${account.email || ""} ${account.slotTag || ""} ${account.channel || ""} ${account.planType || ""}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  }
+  function renderChannelOverview(data) {
+    const cs = data?.channelStats || {};
+    const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
+    const codexTotal = Number(cs.codexTotal ?? accounts.filter((a) => a.channel === "codex").length);
+    const codexActive = Number(cs.codexActive ?? accounts.filter((a) => a.channel === "codex" && a.tokenState === "unexpired_unverified").length);
+    const webTotal = Number(cs.webTotal ?? accounts.filter((a) => a.channel !== "codex").length);
+    const webActive = Number(cs.webActive ?? accounts.filter((a) => a.channel !== "codex" && a.tokenState === "unexpired_unverified").length);
+    const cpaReady = Number(cs.cpaReady ?? codexActive);
+    const softCapped = Number(cs.softCapped ?? accounts.filter((a) => a.softCapped).length);
+
+    if ($("codexChannelCount")) $("codexChannelCount").textContent = String(codexActive);
+    if ($("codexChannelTotal")) $("codexChannelTotal").textContent = String(codexTotal);
+    if ($("cpaReadyCount")) $("cpaReadyCount").textContent = String(cpaReady);
+    if ($("webChannelCount")) $("webChannelCount").textContent = String(webActive);
+    if ($("webChannelTotal")) $("webChannelTotal").textContent = String(webTotal);
+    if ($("softCappedCount")) $("softCappedCount").textContent = String(softCapped);
+
+    const stickyCodex = data?.stickySlots?.codex;
+    const stickyWeb = data?.stickySlots?.text || data?.stickySlots?.image;
+    const codexBadge = $("codexStickyBadge");
+    if (codexBadge) {
+      codexBadge.textContent = stickyCodex ? `🔥 热缓存命中 ${stickyCodex}` : (codexActive > 0 ? "待首请求激活" : "暂无 Codex 号");
+      codexBadge.className = "sticky-indicator " + (stickyCodex ? "hot" : "muted");
+    }
+    const webBadge = $("webStickyBadge");
+    if (webBadge) {
+      webBadge.textContent = stickyWeb ? `🔥 热缓存命中 ${stickyWeb}` : (webActive > 0 ? "待首请求激活" : "暂无可用号");
+      webBadge.className = "sticky-indicator " + (stickyWeb ? "hot" : "muted");
+    }
+
+    const chipHost = $("poolFilterChips");
+    if (chipHost) {
+      const counts = {
+        all: accounts.length,
+        codex: codexTotal,
+        web: webTotal,
+        sticky: accounts.filter((a) => a.stickyActive).length,
+        priority: accounts.filter((a) => a.priority).length,
+        available: accounts.filter((a) => a.quotaStatus === "available").length,
+        softcap: softCapped,
+        abnormal: accounts.filter((a) => matchesPoolFilter(a, "abnormal", "")).length,
+      };
+      const baseLabels = {
+        all: "全部",
+        codex: "Codex 原生",
+        web: "Web 号",
+        sticky: "🔥 当前热缓存",
+        priority: "优先池",
+        available: "生图可用",
+        softcap: "已达 80% 软顶",
+        abnormal: "限流 / 异常",
+      };
+      chipHost.querySelectorAll(".chip").forEach((btn) => {
+        const key = btn.dataset.filter || "all";
+        const n = counts[key] ?? 0;
+        btn.textContent = `${baseLabels[key] || key} (${n})`;
+        btn.classList.toggle("active", key === poolFilter);
+      });
+    }
+  }
   function renderStatsView(data) {
+    lastStatsSnapshot = data;
+    const softCapPct = Number(data?.softCapPercent ?? 80);
     const qs = data?.quotaStats || {};
     const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
     const totalAccounts = Number(qs.total ?? accounts.length ?? 0);
@@ -565,6 +753,8 @@
 
     const tbody = $("statsRows");
     if (!accounts.length) {
+      if ($("statsPageInfo")) $("statsPageInfo").textContent = "";
+      if ($("statsPagination")) $("statsPagination").classList.add("hidden");
       const tr = el("tr");
       const td = el("td", "stats-empty", "号池暂无账号，暂无额度统计明细。");
       td.colSpan = 7;
@@ -573,27 +763,72 @@
       return;
     }
 
+    const qFilter = statsSearch.trim().toLowerCase();
+    const filtered = qFilter
+      ? accounts.filter((a) => `${a.slotLabel || ""} ${a.email || ""} ${a.slotTag || ""} ${a.channel || ""} ${a.planType || ""}`.toLowerCase().includes(qFilter))
+      : accounts;
+
+    const totalPages = Math.max(1, Math.ceil(filtered.length / STATS_PAGE_SIZE));
+    if (statsPage > totalPages) statsPage = totalPages;
+    if (statsPage < 1) statsPage = 1;
+    const pageSlice = filtered.slice((statsPage - 1) * STATS_PAGE_SIZE, statsPage * STATS_PAGE_SIZE);
+
+    if ($("statsPageInfo")) {
+      $("statsPageInfo").textContent = filtered.length
+        ? `显示 ${(statsPage - 1) * STATS_PAGE_SIZE + 1}–${Math.min(filtered.length, statsPage * STATS_PAGE_SIZE)} / 共 ${filtered.length} 条`
+        : "无匹配账号";
+    }
+    if ($("statsPagination")) {
+      $("statsPagination").classList.toggle("hidden", totalPages <= 1);
+      if ($("statsPrevPage")) $("statsPrevPage").disabled = statsPage <= 1;
+      if ($("statsNextPage")) $("statsNextPage").disabled = statsPage >= totalPages;
+    }
+
+    if (!pageSlice.length) {
+      const tr = el("tr");
+      const td = el("td", "stats-empty", "没有匹配当前搜索词的账号。");
+      td.colSpan = 7;
+      tr.append(td);
+      tbody.replaceChildren(tr);
+      return;
+    }
+
     const rows = [];
-    for (const account of accounts) {
+    for (const account of pageSlice) {
       const tr = el("tr");
       const q = quotaBadgeInfo(account);
       const nameTd = el("td");
       nameTd.append(el("strong", "", account.slotLabel || account.email));
+      if (account.stickyActive) {
+        nameTd.append(" ", el("span", "pill sticky-hot", "🔥 热缓存"));
+      }
       if (account.priority) {
         nameTd.append(" ", el("span", "pill priority", "优先"));
       }
       tr.append(nameTd);
 
       const planTd = el("td");
-      planTd.append(el("span", "pill " + (account.planType ? "plan" : "neutral"),
+      const chPill = account.channel === "codex"
+        ? el("span", "pill codex", "Codex")
+        : el("span", "pill web", "Web");
+      planTd.append(chPill, " ", el("span", "pill " + (account.planType ? "plan" : "neutral"),
         account.planType ? account.planType.toUpperCase() : "未知"));
       tr.append(planTd);
 
       const statusTd = el("td");
       statusTd.append(el("span", "pill " + q.cls, q.statusLabel));
+      if (account.softCapped) {
+        statusTd.append(" ", el("span", "pill softcap", `≥${softCapPct}% 软顶`));
+      }
       tr.append(statusTd);
 
-      const quotaTd = el("td", "quota-num", q.quotaCell);
+      const quotaTd = el("td", "quota-num");
+      const quotaText = typeof account.imageQuota === "number" && typeof account.imageQuotaMax === "number"
+        ? `${account.imageQuota} / ${account.imageQuotaMax}`
+        : q.quotaCell;
+      quotaTd.append(el("span", "", quotaText));
+      const meter = createUsageMeterNode(account, softCapPct);
+      if (meter) quotaTd.append(" ", meter);
       if (q.title) quotaTd.title = q.title;
       tr.append(quotaTd);
 
@@ -627,9 +862,13 @@
     tbody.replaceChildren(...rows);
   }
   function renderPoolView(data) {
+    lastPoolSnapshot = data;
+    const softCapPct = Number(data?.softCapPercent ?? 80);
     $("poolCount").textContent = data.total;
+    renderChannelOverview(data);
     const summary = data.summary || { total: data.total, valid: 0, needsRenew: 0 };
     const qs = data.quotaStats || {};
+    const cs = data.channelStats || {};
     if (data.total) {
       const quotaSeg = qs.checked > 0
         ? ` · 生图可用 ${qs.active ?? 0} · 限流 ${qs.limited ?? 0} · 剩余额度 ${qs.totalQuota ?? 0}`
@@ -638,28 +877,66 @@
       const prioritySeg = priorityCount > 0
         ? ` · 优先号池 ${priorityCount}`
         : "";
+      const channelSeg = ` · Codex ${cs.codexActive ?? 0}/${cs.codexTotal ?? 0} · Web ${cs.webActive ?? 0}/${cs.webTotal ?? data.total}`;
       $("poolSummary").textContent =
-        `共 ${summary.total} 个入池账号 · 有效 ${summary.valid} · 待续期/异常 ${summary.needsRenew}${prioritySeg}${quotaSeg}`;
+        `共 ${summary.total} 个入池账号 · 有效 ${summary.valid} · 待续期/异常 ${summary.needsRenew}${channelSeg}${prioritySeg}${quotaSeg}`;
     } else {
       $("poolSummary").textContent = "号池暂无账号 · 请先导入账号";
     }
     const list = $("poolList");
     list.replaceChildren();
     if (!data.accounts.length) {
-      list.append(el("div", "empty", "独立号池暂无账号。请在「批量导入」进行网页登录授权或批量导入 TXT 账号。"));
+      if ($("poolPagination")) $("poolPagination").classList.add("hidden");
+      list.append(el("div", "empty", "独立号池暂无账号。请在「批量导入」进行 Codex 网页登录授权或批量导入 TXT 账号。"));
       setPoolBusyState(poolBusy);
       return;
     }
-    for (const account of data.accounts) {
-      const item = el("div", "account-row" + (account.priority ? " is-priority" : ""));
+    const filtered = data.accounts.filter((a) => matchesPoolFilter(a, poolFilter, poolSearch.trim()));
+    const totalPages = Math.max(1, Math.ceil(filtered.length / POOL_PAGE_SIZE));
+    if (poolPage > totalPages) poolPage = totalPages;
+    if (poolPage < 1) poolPage = 1;
+    const pageItems = filtered.slice((poolPage - 1) * POOL_PAGE_SIZE, poolPage * POOL_PAGE_SIZE);
+
+    if ($("poolPagination")) {
+      $("poolPagination").classList.toggle("hidden", totalPages <= 1);
+      if ($("poolPageInfo")) {
+        $("poolPageInfo").textContent = `第 ${poolPage} / ${totalPages} 页 · 当前筛选匹配 ${filtered.length} 个账号（每页 ${POOL_PAGE_SIZE} 个）`;
+      }
+      if ($("poolPrevPage")) $("poolPrevPage").disabled = poolPage <= 1;
+      if ($("poolNextPage")) $("poolNextPage").disabled = poolPage >= totalPages;
+    }
+
+    if (!pageItems.length) {
+      list.append(el("div", "empty", "当前筛选或搜索条件下没有匹配的账号，可点击「全部」胶囊重置筛选。"));
+      setPoolBusyState(poolBusy);
+      return;
+    }
+
+    for (const account of pageItems) {
+      const rowCls = "account-row" +
+        (account.priority ? " is-priority" : "") +
+        (account.stickyActive ? " is-sticky" : "");
+      const item = el("div", rowCls);
       const left = el("div", "account-main");
       const head = el("div", "account-head");
       head.append(el("strong", "", account.slotLabel || account.email));
+      if (account.stickyActive) {
+        const rolesMap = { codex: "Codex", text: "对话", image: "生图" };
+        const roleTxt = Array.isArray(account.stickyRoles) && account.stickyRoles.length
+          ? account.stickyRoles.map((r) => rolesMap[r] || r).join("/")
+          : "热会话";
+        head.append(el("span", "pill sticky-hot", `🔥 热缓存 (${roleTxt})`));
+      }
       if (account.priority) {
         head.append(el("span", "pill priority", "优先"));
       }
+      if (account.channel === "codex") {
+        head.append(el("span", "pill codex", "Codex 原生"));
+      } else {
+        head.append(el("span", "pill web", "Web 对话/生图"));
+      }
       if (account.authType === "oauth") {
-        head.append(el("span", "pill oauth", "网页授权"));
+        head.append(el("span", "pill oauth", "OAuth 续期"));
       }
       const badge = poolTokenBadges[account.tokenState] || (account.hasAccess
         ? poolTokenBadges.unexpired_unverified
@@ -668,27 +945,40 @@
       if (account.planType) {
         head.append(el("span", "pill plan", account.planType.toUpperCase()));
       }
+      if (account.softCapped) {
+        head.append(el("span", "pill softcap", `已达 ${softCapPct}% 软顶`));
+      }
       left.append(head);
 
       const q = quotaBadgeInfo(account);
       const usagePart = (account.successCalls || account.failCalls)
-        ? `成功 ${account.successCalls || 0} / 失败 ${account.failCalls || 0}`
+        ? `生图成功 ${account.successCalls || 0} / 失败 ${account.failCalls || 0}`
+        : "";
+      const textWinPart = account.textWindowCalls > 0
+        ? `文本窗口 ${account.textWindowCalls}/${account.textWindowMaxCalls || 10}`
+        : "";
+      const codexPctPart = typeof account.codexUsedPercent === "number"
+        ? `Codex 窗口已用 ${account.codexUsedPercent}%`
         : "";
       const resetPart = account.quotaResetAt ? formatTime(account.quotaResetAt, "预计恢复 ") : "";
       const checkedPart = account.quotaCheckedAt ? formatTime(account.quotaCheckedAt, "额度检测于 ") : "";
       const errPart = account.quotaError ? "额度错误：" + account.quotaError : "";
       const sub = [
         formatTime(account.updatedAt),
+        codexPctPart,
+        textWinPart,
         checkedPart,
         resetPart,
         usagePart,
         errPart,
         rowMessages.get(account.id),
       ].filter(Boolean).join(" · ");
-      left.append(el("small", "", sub || "已在 Providers 独立入驻 · 轮询与故障转移就绪 · Token 无明文显示"));
+      left.append(el("small", "", sub || "已在 Providers 独立入驻 · 80% 保缓存粘性路由与故障转移就绪"));
       item.append(left);
 
       const side = el("div", "account-side");
+      const meterNode = createUsageMeterNode(account, softCapPct);
+      if (meterNode) side.append(meterNode);
       const quotaPill = el("span", "quota-pill " + q.cls, q.pillText);
       if (q.title) quotaPill.title = q.title;
       side.append(quotaPill);
@@ -722,6 +1012,13 @@
         el("span", "switch-track", ""),
         el("span", "switch-label", "优先使用"),
       );
+      const pingBtn = el("button", "btn secondary small", "⚡ 测速");
+      pingBtn.type = "button";
+      pingBtn.disabled = poolBusy;
+      pingBtn.title = "实测该账号首字响应延迟（TTFT）";
+      pingBtn.addEventListener("click", () => {
+        void runPingTest(account.id, account.slotLabel || account.email);
+      });
       const refresh = el("button", "btn secondary small", "检测/刷新");
       refresh.type = "button";
       refresh.disabled = poolBusy;
@@ -753,7 +1050,7 @@
         }
         catch (err) { notice(err.message, true); remove.disabled = false; }
       });
-      controls.append(priorityLabel, refresh, remove);
+      controls.append(priorityLabel, pingBtn, refresh, remove);
       side.append(controls);
       item.append(side);
       list.append(item);
@@ -791,6 +1088,9 @@
       renderStatsView(data);
       renderPoolView({
         total: data.total,
+        softCapPercent: data.softCapPercent,
+        stickySlots: data.stickySlots,
+        channelStats: data.channelStats,
         summary: {
           total: data.total,
           valid: (data.accounts || []).filter((a) => a.tokenState === "unexpired_unverified").length,
@@ -861,6 +1161,9 @@
     policyState = data;
     const settings = data.settings;
     renderStrategyCards(data.strategies || [], settings.rotation.strategy);
+    const softPct = Number(settings.rotation.softCapPercent ?? 80);
+    if ($("softCapPercent")) $("softCapPercent").value = String(softPct);
+    if ($("softCapValueLabel")) $("softCapValueLabel").textContent = softPct + "%";
     $("skipRateLimited").checked = settings.rotation.skipRateLimited;
     $("respectPreferredSlot").checked = settings.rotation.respectPreferredSlot;
     $("sweepEnabled").checked = settings.sweep.enabled;
@@ -870,7 +1173,7 @@
     $("sweepHint").textContent = sweepHintText(settings, data.sweep);
     const strategy = (data.strategies || []).find((s) => s.id === settings.rotation.strategy);
     $("policyHint").textContent = strategy
-      ? `当前生效：${strategy.name}。${settings.rotation.skipRateLimited ? "限流账号自动排到队尾。" : "注意：已关闭跳过限流账号，耗尽额度的账号仍可能被尝试。"}`
+      ? `当前生效：${strategy.name}（换号软阈值 ${softPct}%）。${settings.rotation.skipRateLimited ? "限流账号自动排到队尾。" : "注意：已关闭跳过限流账号，耗尽额度的账号仍可能被尝试。"}`
       : "";
   }
 
@@ -887,6 +1190,7 @@
     const next = {
       rotation: {
         strategy: policyState.settings.rotation.strategy,
+        softCapPercent: Number($("softCapPercent")?.value || 80),
         skipRateLimited: $("skipRateLimited").checked,
         respectPreferredSlot: $("respectPreferredSlot").checked,
       },
@@ -1096,11 +1400,55 @@
     });
     $("refreshAccounts").addEventListener("click", loadPool);
     $("refreshAllPool").addEventListener("click", () => refreshAccounts({ all: true }));
+    $("refreshAbnormalPool")?.addEventListener("click", () => refreshAccounts({ abnormalOnly: true }));
+    $("pruneInvalidBtn")?.addEventListener("click", pruneInvalidAccounts);
+    $("pingPoolBtn")?.addEventListener("click", () => runPingTest());
+    $("headerPingBtn")?.addEventListener("click", () => runPingTest());
     $("syncProviders")?.addEventListener("click", syncProvidersNow);
     $("exportCpa")?.addEventListener("click", exportCpaNow);
     $("refreshStatsQuota")?.addEventListener("click", () => refreshAccounts({ all: true, quotaOnly: true }));
     $("reloadStats")?.addEventListener("click", loadStats);
     $("savePolicy")?.addEventListener("click", savePolicy);
+    $("softCapPercent")?.addEventListener("input", () => {
+      if ($("softCapValueLabel")) $("softCapValueLabel").textContent = $("softCapPercent").value + "%";
+    });
+    $("poolFilterChips")?.addEventListener("click", (ev) => {
+      const btn = ev.target.closest?.(".chip");
+      if (!btn || !btn.dataset.filter) return;
+      poolFilter = btn.dataset.filter;
+      poolPage = 1;
+      if (lastPoolSnapshot) renderPoolView(lastPoolSnapshot);
+    });
+    $("poolSearchInput")?.addEventListener("input", () => {
+      poolSearch = $("poolSearchInput").value || "";
+      poolPage = 1;
+      if (lastPoolSnapshot) renderPoolView(lastPoolSnapshot);
+    });
+    $("poolPrevPage")?.addEventListener("click", () => {
+      if (poolPage > 1) {
+        poolPage--;
+        if (lastPoolSnapshot) renderPoolView(lastPoolSnapshot);
+      }
+    });
+    $("poolNextPage")?.addEventListener("click", () => {
+      poolPage++;
+      if (lastPoolSnapshot) renderPoolView(lastPoolSnapshot);
+    });
+    $("statsSearchInput")?.addEventListener("input", () => {
+      statsSearch = $("statsSearchInput").value || "";
+      statsPage = 1;
+      if (lastStatsSnapshot) renderStatsView(lastStatsSnapshot);
+    });
+    $("statsPrevPage")?.addEventListener("click", () => {
+      if (statsPage > 1) {
+        statsPage--;
+        if (lastStatsSnapshot) renderStatsView(lastStatsSnapshot);
+      }
+    });
+    $("statsNextPage")?.addEventListener("click", () => {
+      statsPage++;
+      if (lastStatsSnapshot) renderStatsView(lastStatsSnapshot);
+    });
     $("runSweep")?.addEventListener("click", runSweepNow);
     $("reloadLogs")?.addEventListener("click", loadLogs);
     $("logOnlyFailures")?.addEventListener("change", loadLogs);

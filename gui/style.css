@@ -249,3 +249,48 @@ footer { text-align: center; margin-top: 18px; color: var(--muted); font-size: 1
 .priority-switch input:checked ~ .switch-label { color: var(--accent); font-weight: 600 }
 .priority-switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px }
 .priority-switch.busy { opacity: .6; pointer-events: none }
+
+/* --- dual-channel overview, sticky cache badge, filter chips, pagination & TTFT ping --- */
+.header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap }
+.ping-banner { margin-top: 14px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--active-card-border); background: var(--good-bg); color: var(--good); font-size: 12.5px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap }
+.ping-banner.error { border-color: var(--bad); background: var(--bad-bg); color: var(--bad) }
+.channel-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 12px 0 6px }
+.channel-card { border: 1px solid var(--line); border-radius: 12px; background: var(--bg); padding: 13px 15px }
+.channel-card.codex-card { border-left: 3px solid #7c4dff }
+.channel-card.web-card { border-left: 3px solid var(--accent) }
+.channel-card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; flex-wrap: wrap }
+.channel-card-num { font-size: 13px; margin-bottom: 4px }
+.channel-card-num strong { font-size: 24px; font-weight: 750; font-variant-numeric: tabular-nums; margin-right: 4px }
+.channel-tag, .pill.codex, .pill.web { display: inline-flex; align-items: center; font-size: 11px; font-weight: 680; border-radius: 99px; padding: 2px 9px; white-space: nowrap }
+.channel-tag.codex, .pill.codex { background: rgba(124, 77, 255, .14); color: #7c4dff }
+@media (prefers-color-scheme: dark) {
+  .channel-tag.codex, .pill.codex { background: rgba(163, 133, 255, .2); color: #c4b0ff }
+}
+.channel-tag.web, .pill.web { background: var(--accent-weak); color: var(--accent) }
+.sticky-indicator { font-size: 11.5px; font-weight: 640 }
+.sticky-indicator.hot { color: var(--good) }
+.pill.sticky-hot { background: var(--good-bg); color: var(--good); border: 1px solid var(--active-card-border) }
+.pill.softcap { background: var(--warn-bg); color: var(--warn) }
+.account-row.is-sticky { box-shadow: inset 3px 0 0 var(--good) }
+.filter-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 12px 0 10px }
+.filter-bar.compact { margin: 10px 0 }
+.filter-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap }
+.chip { border: 1px solid var(--line); border-radius: 99px; background: var(--bg); color: var(--muted); padding: 4px 11px; font-size: 12px; font-weight: 600; transition: all .14s ease }
+.chip:hover { border-color: var(--accent); color: var(--text) }
+.chip.active { background: var(--accent); border-color: var(--accent); color: #fff }
+.pool-search { min-width: 210px; max-width: 280px; flex: 1; padding: 6px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font-size: 12px }
+.pool-search:focus { border-color: var(--accent); outline: none }
+.pagination-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; flex-wrap: wrap }
+.pagination-btns { display: inline-flex; align-items: center; gap: 8px }
+.usage-meter { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums }
+.usage-bar { width: 54px; height: 6px; border-radius: 99px; background: var(--line); overflow: hidden; display: inline-block }
+.usage-fill { display: block; height: 100%; border-radius: inherit; background: var(--good) }
+.usage-fill.warn { background: var(--warn) }
+.usage-fill.bad { background: var(--bad) }
+.softcap-box { border: 1px solid var(--line); border-radius: 10px; background: var(--bg); padding: 12px 14px; margin: 12px 0 }
+.softcap-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12.5px; margin-bottom: 8px }
+.softcap-box input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer }
+.softcap-marks { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; flex-wrap: wrap }
+@media (max-width: 720px) {
+  .channel-cards { grid-template-columns: 1fr }
+}

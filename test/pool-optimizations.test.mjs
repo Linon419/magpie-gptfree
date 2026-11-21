@@ -31,6 +31,7 @@ import {
 } from "../lib/pool-stats.mjs";
 import { clearPoolVaultCache, listPool, upsertManyPool } from "../lib/pool-vault.mjs";
 import { runBatch } from "../lib/importer.mjs";
+import { createGuiService } from "../lib/gui-service.mjs";
 
 const seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
@@ -418,5 +419,147 @@ test("Python daemon pool reuses warm worker process across consecutive calls", a
   } finally {
     closeImageWorkerPool();
     closeTextWorkerPool();
+  }
+});
+
+test("GUI exposes Codex vs Web channel overview, 80% softCapPercent setting, abnormalOnly refresh, batch dead-account prune, and TTFT ping without secrets", async () => {
+  clearCodexRuntimeState();
+  clearTextCooldowns();
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-v2-"));
+  const records = [
+    {
+      email: "codex-pro@example.com",
+      password: "",
+      totp: "",
+      accessToken: codexJwt("codex-pro@example.com"),
+      refreshToken: "rt_secret_codex",
+      authType: "oauth",
+    },
+    {
+      email: "web-free@example.com",
+      password: "pw",
+      totp: seed,
+      accessToken: webJwt("web-free@example.com"),
+    },
+    {
+      email: "dead-broken@example.com",
+      password: "pw",
+      totp: seed,
+      accessToken: "",
+    },
+  ];
+  const store = createInMemoryStatsStore();
+  await recordQuotaCheck({ email: "codex-pro@example.com", quota: 50, hasImageLimit: true, planType: "plus" }, { statsStore: store });
+  await recordQuotaCheck({ email: "web-free@example.com", quota: 1, hasImageLimit: true, planType: "free" }, { statsStore: store });
+  // Simulate web-free having 5 max and 1 remaining (= 80% used -> softCapped!)
+  store.state.accounts[accountSlotTag("web-free@example.com")].imageQuotaMax = 5;
+
+  let refreshedEmails = [];
+  const service = createGuiService({
+    port: 0,
+    sessionFile: false,
+    settingsFile: join(dir, "pool-settings.json"),
+    eventsFile: join(dir, "pool-events.jsonl"),
+    startSweep: null,
+    statsStore: store,
+    poolRead: async () => records,
+    poolRemoveMany: async (emails) => {
+      for (const e of emails) {
+        const idx = records.findIndex((r) => r.email === e);
+        if (idx >= 0) records.splice(idx, 1);
+      }
+    },
+    refreshAccount: async (row) => {
+      refreshedEmails.push(row.email);
+      return { ok: true, status: "renewed", renewed: true, tokenState: "unexpired_unverified" };
+    },
+    webTextRunner: async (_payload, { onDelta }) => {
+      onDelta?.("Pong");
+      return { ok: true, text: "Pong" };
+    },
+    fetcher: async () => new Response(
+      'event: response.output_text.delta\ndata: {"delta":"Pong"}\n\nevent: response.completed\ndata: {}\n\n',
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+  });
+
+  const addr = await service.listen();
+  const base = `http://127.0.0.1:${addr.port}/`;
+  try {
+    const html = await (await fetch(`${base}ui`)).text();
+    for (const expected of [
+      "Codex 原生号池",
+      "Web 对话 / 生图号池",
+      "softCapPercent",
+      "poolFilterChips",
+      "poolSearchInput",
+      "pruneInvalidBtn",
+      "refreshAbnormalPool",
+      "headerPingBtn",
+    ]) {
+      assert.ok(html.includes(expected), `missing GUI element: ${expected}`);
+    }
+    const appJs = await (await fetch(`${base}assets/app.js`)).text();
+    assert.ok(!appJs.includes("innerHTML"), "must never use innerHTML");
+    assert.ok(!appJs.includes("localStorage"), "must never use localStorage");
+
+    const cap = html.match(/meta name="gptfree-session" content="([0-9a-f]{64})"/)?.[1];
+    assert.ok(cap);
+    const api = async (route, body) => {
+      const headers = { Origin: "null", "X-GPTFree-Session": cap };
+      if (body !== undefined) headers["Content-Type"] = "application/json";
+      const r = await fetch(`${base}api/${route}`, {
+        method: body === undefined ? "GET" : "POST",
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      return { status: r.status, json: await r.json() };
+    };
+
+    // 1. Channel classification & 80% softCapped flag in /api/accounts
+    const snap1 = await api("accounts");
+    assert.equal(snap1.status, 200);
+    assert.equal(snap1.json.channelStats.codexTotal, 1);
+    assert.equal(snap1.json.channelStats.codexActive, 1);
+    assert.equal(snap1.json.channelStats.cpaReady, 1);
+    assert.equal(snap1.json.channelStats.webTotal, 2);
+    assert.equal(snap1.json.channelStats.webActive, 1);
+    assert.equal(snap1.json.channelStats.softCapped, 1);
+    assert.ok(!JSON.stringify(snap1.json).includes("rt_secret_codex"));
+    assert.ok(!JSON.stringify(snap1.json).includes("codex-pro@example.com"));
+
+    // 2. Save custom softCapPercent (75%) via /api/settings
+    const setRes = await api("settings", { rotation: { softCapPercent: 75 } });
+    assert.equal(setRes.status, 200);
+    assert.equal(setRes.json.settings.rotation.softCapPercent, 75);
+
+    // 3. abnormalOnly refresh only touches dead-broken@example.com, skipping healthy ones
+    refreshedEmails = [];
+    const abnRes = await api("accounts/refresh", { abnormalOnly: true });
+    assert.equal(abnRes.status, 200);
+    assert.deepEqual(refreshedEmails, ["dead-broken@example.com"]);
+
+    // 4. Batch prune removes only broken/missing-token accounts
+    const pruneRes = await api("remove-batch", { mode: "invalid" });
+    assert.equal(pruneRes.status, 200);
+    assert.equal(pruneRes.json.removed, 1);
+    assert.equal(pruneRes.json.remaining, 2);
+
+    // 5. TTFT ping measures latency on both default pool and specific Web slot
+    const pingCodex = await api("accounts/ping", {});
+    assert.equal(pingCodex.status, 200);
+    assert.equal(pingCodex.json.ok, true);
+    assert.equal(pingCodex.json.channel, "codex");
+    assert.equal(typeof pingCodex.json.ttftMs, "number");
+
+    const webRow = pruneRes.json.accounts.find((a) => a.channel === "web");
+    const pingWeb = await api("accounts/ping", { id: webRow.id });
+    assert.equal(pingWeb.status, 200);
+    assert.equal(pingWeb.json.ok, true);
+    assert.equal(pingWeb.json.channel, "web");
+    assert.equal(pingWeb.json.reply, "Pong");
+  } finally {
+    await service.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
