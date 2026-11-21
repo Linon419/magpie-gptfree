@@ -138,6 +138,30 @@ test("expired restoreAt automatically restores quota in effectiveAccountImageQuo
   const statsAfter = await readPoolStats({ statsStore: store });
   assert.equal(statsAfter.accounts[accountSlotTag(email)].imageQuota, 4);
   assert.equal(statsAfter.accounts[accountSlotTag(email)].restoreAt, null);
+
+  // When OpenAI lowers an idle account's daily Free cap (e.g. Nov 12 promo 25 -> 5),
+  // a fresh 24h window check resets imageQuotaMax to 5 instead of falsely reporting 80% used!
+  const lowered = "promo-ended@example.com";
+  await recordQuotaCheck({
+    email: lowered,
+    quota: 25,
+    restoreAt: new Date(Date.now() - 5 * 86400_000).toISOString(),
+    hasImageLimit: true,
+    planType: "free",
+  }, { statsStore: store });
+  await recordQuotaCheck({
+    email: lowered,
+    quota: 5,
+    restoreAt: new Date(Date.now() + 86395_000).toISOString(),
+    hasImageLimit: true,
+    planType: "free",
+  }, { statsStore: store });
+  const afterLower = await readPoolStats({ statsStore: store });
+  const effLower = effectiveAccountImageQuota(lowered, afterLower);
+  assert.equal(effLower.max, 5);
+  assert.equal(effLower.remaining, 5);
+  assert.equal(effLower.usedRatio, 0);
+  assert.equal(isAccountImageSoftCapped(lowered, afterLower), false);
 });
 
 test("web text generation sticks to one account until 80% of window calls, then switches cleanly", async () => {
