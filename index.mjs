@@ -9,7 +9,7 @@ import { configureTextCooldownStore } from "./lib/chatgpt-web-text.mjs";
 import { poolDir } from "./lib/pool-vault.mjs";
 import { join } from "node:path";
 import { createPoolConnector, POOL_MARKER, POOL_PROVIDER } from "./lib/pool-connection.mjs";
-import { nativeImportMethod } from "./lib/provider-native-signin.mjs";
+import { nativeImportMethod, webOAuthMethod } from "./lib/provider-native-signin.mjs";
 import { readAutoRefreshSettings, startAutoRefresh } from "./lib/auto-refresh.mjs";
 
 let sharedClient = null;
@@ -46,31 +46,30 @@ export const GPTFreeGuiPlugin = async (ctx, options) => {
     throw new Error("GPT号池 GUI: invalid service port");
   const connection = ensurePoolConnector(ctx) || createPoolConnector(ctx.client);
   // The GUI port is normally held by the previous host, which is still
-  // shutting down (a host restart overlaps the two for a moment), and an
-  // older Magpie instance can hold it for longer. The pool's provider side
-  // does not need the GUI service, so the plugin keeps loading and the page
-  // comes back by itself once the port is free.
+  // shutting down: a host restart overlaps the two for a moment, and an
+  // older Magpie instance can hold it for longer. Do not await port binding
+  // during plugin load so the provider's models hook registers immediately;
+  // if the initial 30s retry window still sees EADDRINUSE, fall back to
+  // background exponential backoff until the port is freed.
   const log = (level, message) => Promise.resolve(ctx?.client?.app?.log?.({
     body: { service: "gptfree", level, message },
   })).catch(() => {});
-  if (!guiRetry) {
-    let warned = false;
-    guiRetry = startGuiServerWithRetry({
-      port,
-      onPoolChange: () => connection.sync(),
-      onWaiting: (error, delay) => {
-        if (warned) return;
-        warned = true;
-        void log("warn", "GPT号池 GUI service could not start (" +
-          String(error?.message || error) + "); the pool provider stays available, " +
-          "retrying every " + Math.round(delay / 1000) + "s+ until the port is free");
-      },
-      onStarted: () => {
-        if (warned) void log("info", "GPT号池 GUI service started on 127.0.0.1:" + port);
-      },
-    });
-  }
-  await guiRetry.first;
+  guiRetry?.stop();
+  guiRetry = null;
+  startGuiServer({ port, onPoolChange: () => connection.sync() }).catch((error) => {
+    void log("warn", "GPT号池 GUI service could not start (" +
+      String(error?.message || error) + "); the pool provider stays available, " +
+      "retrying in background until the port is free");
+    if (!process.env.NODE_TEST_CONTEXT) {
+      guiRetry = startGuiServerWithRetry({
+        port,
+        onPoolChange: () => connection.sync(),
+        onStarted: () => {
+          void log("info", "GPT号池 GUI service started on 127.0.0.1:" + port);
+        },
+      });
+    }
+  });
   // Restore Magpie's per-account local-pool slots automatically after
   // restarting. A corrupt vault must not make the GUI inaccessible.
   try {
@@ -124,15 +123,22 @@ export const GPTFreePoolPlugin = async (ctx = {}) => {
     auth: {
       provider: POOL_PROVIDER,
       maxConcurrency: 2,
-      // Native Magpie prompt & file chooser; never opens an external website.
       // Multi-account management stays enabled so every pooled account gets its
-      // own toggleable row in Magpie Providers.
-      methods: [nativeImportMethod({
-        ...(connector ? { server: () => startGuiServer({ port: GUI_PORT, onPoolChange: () => sharedConnector?.sync() }) } : {}),
-        syncPool: () => sharedConnector?.sync(),
-        claimSlotKey: (slot, key) => sharedConnector?.claimKey(slot, key),
-        activeKey: () => (sharedActiveKey ? sharedActiveKey() : ""),
-      })],
+      // own toggleable row in Magpie Providers. Supports both browser OAuth
+      // sign-in (open or copy link) and native TXT batch file import.
+      methods: [
+        webOAuthMethod({
+          syncPool: () => sharedConnector?.sync(),
+          claimSlotKey: (slot, key) => sharedConnector?.claimKey(slot, key),
+          activeKey: () => (sharedActiveKey ? sharedActiveKey() : ""),
+        }),
+        nativeImportMethod({
+          ...(connector ? { server: () => startGuiServer({ port: GUI_PORT, onPoolChange: () => sharedConnector?.sync() }) } : {}),
+          syncPool: () => sharedConnector?.sync(),
+          claimSlotKey: (slot, key) => sharedConnector?.claimKey(slot, key),
+          activeKey: () => (sharedActiveKey ? sharedActiveKey() : ""),
+        }),
+      ],
       async loader(getAuth) {
         const auth = await getAuth();
         if (auth?.type !== "api") return {};
